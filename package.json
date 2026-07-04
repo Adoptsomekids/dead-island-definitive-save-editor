@@ -1,0 +1,40 @@
+{
+  "name": "dead-island-definitive-save-editor",
+  "version": "0.1.0",
+  "description": "Xbox Series X save editor for Dead Island Definitive Edition",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "dev": "ts-node src/index.ts",
+    "test": "jest",
+    "lint": "eslint src/**/*.ts",
+    "start": "electron .",
+    "start:web": "vite"
+  },
+  "keywords": [
+    "dead-island",
+    "save-editor",
+    "xbox",
+    "game-mod",
+    "definitive-edition"
+  ],
+  "author": "Adoptsomekids",
+  "license": "MIT",
+  "dependencies": {
+    "big-integer": "^1.6.52",
+    "crc-32": "^1.2.2",
+    "fzstd": "^0.1.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.4.0",
+    "ts-node": "^10.9.0",
+    "jest": "^29.0.0",
+    "@types/jest": "^29.5.0",
+    "ts-jest": "^29.0.0",
+    "eslint": "^8.57.0",
+    "@typescript-eslint/parser": "^7.0.0",
+    "@typescript-eslint/eslint-plugin": "^7.0.0"
+  }
+}

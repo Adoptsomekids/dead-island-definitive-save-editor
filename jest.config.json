@@ -1,0 +1,9 @@
+{
+  "testEnvironment": "node",
+  "testMatch": ["**/tests/**/*.test.ts"],
+  "collectCoverageFrom": ["src/**/*.ts"],
+  "coverageDirectory": "coverage",
+  "transform": {
+    "^.+\\.tsx?$": ["ts-jest", { "tsconfig": "tsconfig.json" }]
+  }
+}
