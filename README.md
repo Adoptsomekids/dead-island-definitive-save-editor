@@ -1,7 +1,8 @@
 # Dead Island Definitive Edition — Save Editor
 
-> Xbox Series X save editor for **Dead Island Definitive Edition**.  
+> Xbox Series X save editor for **Dead Island Definitive Edition**.
 > Edit inventory, skills, map fog, collectibles, player stats and more.
+> **Works natively on macOS** — no Windows required.
 
 ---
 
@@ -10,13 +11,15 @@
 | Feature | Status |
 |---------|--------|
 | 📦 Inventory management (items, weapons, mods) | 🚧 In progress |
-| 🧠 Skills respec & unlock all | 🚧 In progress |
+| 🧠 Skills respec & unlock all | ✅ Done |
+| 🏆 Collectibles unlock (ID cards, news, tapes, blueprints) | ✅ Done |
+| 💀 God mode (max health) | ✅ Done |
+| ♾️ Max durability on all items | ✅ Done |
+| 🎮 Level to 60 + max skill points | ✅ Done |
+| 💰 Max cash | ✅ Done |
+| 📡 Download save from Xbox Series X over WiFi (Device Portal) | ✅ Done |
+| 📡 Upload edited save back to Xbox over WiFi | ✅ Done |
 | 🗺️ Map fog of war clear/reveal | 🚧 In progress |
-| 🏆 Collectibles unlock (ID cards, news, tapes) | 🚧 In progress |
-| 💀 God mode / infinite stamina toggles | 🚧 In progress |
-| ♾️ Infinite ammo / durability | 🚧 In progress |
-| 🎮 Xbox Series X save extraction via [Xbox Backup Creator](https://www.360haven.com) | 📋 Planned |
-| 💾 Re-inject edited save back to Xbox profile | 📋 Planned |
 
 ---
 
@@ -31,7 +34,11 @@
 
 - **Node.js** 18+ and **npm** 9+
 - **TypeScript** 5+
-- (Optional) [Horizon](https://www.wemod.com/horizon) or [Xbox Backup Creator](https://www.xbox-scene.info) to extract `.sav` files from your Xbox profile
+- Xbox Series X with **Developer Mode** active (see [How to Extract Your Save](#how-to-extract-your-xbox-save))
+
+> **Note:** Horizon, Modio, and Xbox Backup Creator are Xbox 360-only tools.
+> They do NOT work with Xbox Series X saves. This project uses the official
+> Xbox Device Portal API instead, which works over WiFi from any OS including macOS.
 
 ---
 
@@ -41,32 +48,78 @@
 # Install dependencies
 npm install
 
-# Build
-npm run build
+# Download your save from Xbox (see setup below first)
+npm run sync -- --download --xbox-ip 192.168.1.X --user YOUR_USER --pass YOUR_PASS
 
-# Run CLI editor
-npm run dev -- --input path/to/save.sav --output path/to/output.sav
+# Edit the save
+npm run dev -- --input ./dead-island-save-*.sav --god-mode --max-level --unlock-skills
+
+# Upload the edited save back to Xbox
+npm run sync -- --upload --input ./dead-island-save-*.sav.edited --xbox-ip 192.168.1.X --user YOUR_USER --pass YOUR_PASS
 ```
 
 ---
 
 ## How to Extract Your Xbox Save
 
-### Method 1 — Xbox App (PC)
-1. On PC open the **Xbox App** → find Dead Island Definitive Edition.
-2. Cloud saves sync to `%LOCALAPPDATA%\Packages\*.DeadIsland*\SystemAppData\wgs\`.
-3. Copy the binary save blob from that directory.
+### ✅ The Only Reliable Method: Xbox Developer Mode + Device Portal
 
-### Method 2 — Xbox Backup Creator / Horizon
-1. Put Xbox into **Developer Mode** or use a modded profile tool.
-2. Use **Horizon** (Windows) to browse your profile and extract the save container.
-3. The `.sav` / container binary is the file this editor reads.
+Xbox Series X **does not allow saving to USB** and there is no Xbox App for macOS.
+The only cross-platform solution is the **Xbox Device Portal** — an HTTP server
+built into the console that you access over your local WiFi network.
 
-### Method 3 — USB Transfer (Xbox One / Series X)
-1. On Xbox: **Settings → System → Storage → Transfer → USB**.
-2. Transfer your Dead Island save to a USB drive.
-3. Read the drive on PC — files are in `Xbox360/000D000\...` or `Content/...` paths.
-4. Extract the inner save blob with this editor's `tools/extract-container.ts`.
+#### One-Time Setup (~15 minutes, costs $19 USD)
+
+1. On your PC or Mac, go to **[dev.xbox.com](https://dev.xbox.com)** and sign in with your Microsoft account.
+2. Register as a developer (one-time $19 USD fee, gives you unlimited Dev Mode activations).
+3. On your Xbox Series X: **Settings → System → Developer settings → Developer Mode**.
+4. Follow the prompts — the console will install the Dev Mode app and reboot.
+5. **Your retail games still work** — Dev Mode and Retail Mode coexist.
+6. When in Dev Mode, open the **Xbox Device Portal** app on the console.
+7. Note the URL shown (e.g. `https://192.168.1.X:11443`) and set a username/password.
+
+#### Daily Use (after setup)
+
+```bash
+# 1. Make sure your Mac and Xbox are on the same WiFi
+# 2. Download your save:
+npx ts-node tools/save-sync.ts --download \
+  --xbox-ip 192.168.1.X \
+  --user YOUR_DEVICE_PORTAL_USER \
+  --pass YOUR_DEVICE_PORTAL_PASS
+
+# Or set env vars to avoid typing credentials:
+export XBOX_IP=192.168.1.X
+export XBOX_USER=admin
+export XBOX_PASS=mypassword
+npx ts-node tools/save-sync.ts --download
+
+# 3. Edit and re-upload (see CLI Usage below)
+```
+
+#### Or use the npm shortcut:
+```bash
+npm run sync -- --download --xbox-ip 192.168.1.X --user admin --pass mypass
+```
+
+---
+
+## CLI Usage
+
+```bash
+# Edit a downloaded save
+npx ts-node src/index.ts --input ./save.sav --output ./save.edited.sav [flags]
+
+# Flags:
+#   --god-mode            Set health to 99999
+#   --max-level           Set level to 60, max XP and skill points
+#   --max-cash            Set cash to 9,999,999
+#   --unlock-skills       Unlock all skills in every tree
+#   --reset-skills        Reset skill trees and refund all points
+#   --max-durability      Set all items to full durability
+#   --unlock-collectibles Unlock all ID cards, news, tapes, blueprints
+#   --dump                Print save contents (no modification)
+```
 
 ---
 
@@ -93,14 +146,16 @@ dead-island-definitive-save-editor/
 │   │   ├── crc32.ts           # CRC-32 checksum
 │   │   └── adler32.ts         # Adler-32 checksum
 │   ├── xbox/
-│   │   ├── container.ts       # Xbox save container parser
-│   │   └── stfs.ts            # STFS package reader (360/One format)
+│   │   ├── device-portal.ts   # Xbox Device Portal HTTP client (macOS/WiFi)
+│   │   ├── container.ts       # Xbox 360 STFS container parser
+│   │   └── stfs.ts            # STFS package reader (Xbox 360 format)
 │   └── data/
 │       ├── items/             # Item ID → name mappings (JSON)
 │       ├── skills/            # Skill tree definitions (JSON)
 │       └── blueprints/        # Blueprint/collectible IDs (JSON)
 ├── tools/
-│   └── extract-container.ts   # CLI tool: unpack Xbox container → raw save
+│   ├── save-sync.ts           # Download/upload saves via Xbox Device Portal (WiFi)
+│   └── extract-container.ts   # CLI tool: unpack Xbox 360 STFS container → raw save
 ├── tests/
 ├── docs/
 │   ├── save-format.md         # Reverse-engineered save file format spec

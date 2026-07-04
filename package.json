@@ -7,6 +7,7 @@
   "scripts": {
     "build": "tsc",
     "dev": "ts-node src/index.ts",
+    "sync": "ts-node tools/save-sync.ts",
     "test": "jest",
     "lint": "eslint src/**/*.ts",
     "start": "electron .",
