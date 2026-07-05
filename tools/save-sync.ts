@@ -1,50 +1,90 @@
 #!/usr/bin/env ts-node
 // tools/save-sync.ts
-// CLI tool: download or upload Dead Island DE saves via Xbox Device Portal
+// CLI tool: download or upload Dead Island DE saves from Xbox Series X.
 //
-// USAGE (from project root):
+// Supports TWO modes:
 //
-//   Download save from Xbox to local file:
-//   npx ts-node tools/save-sync.ts --download --xbox-ip 192.168.1.X --user USERNAME --pass PASSWORD
+// MODE 1 — SaveBridge (recommended, works from Mac over WiFi):
+//   Requires the SaveBridge UWP app running on your Xbox.
+//   See xbox-companion-app/README.md for setup instructions.
 //
-//   Upload edited save back to Xbox:
-//   npx ts-node tools/save-sync.ts --upload --input ./my-edited.sav --xbox-ip 192.168.1.X --user USERNAME --pass PASSWORD
+//   npx ts-node tools/save-sync.ts --download --xbox-ip 192.168.100.27 --bridge-port 8765
+//   npx ts-node tools/save-sync.ts --list     --xbox-ip 192.168.100.27 --bridge-port 8765
+//   npx ts-node tools/save-sync.ts --upload   --input save.sav --xbox-ip 192.168.100.27 --bridge-port 8765
 //
-//   List all game save files on Xbox:
-//   npx ts-node tools/save-sync.ts --list --xbox-ip 192.168.1.X --user USERNAME --pass PASSWORD
+// MODE 2 — Device Portal (only accesses DevelopmentFiles folder):
+//   npx ts-node tools/save-sync.ts --download --xbox-ip 192.168.100.27 --user DevToolsUser --pass PASSWORD
 //
-// PREREQUISITES:
-//   1. Activate Xbox Developer Mode ($19 USD at dev.xbox.com) on your Xbox Series X
-//   2. Find your Xbox IP: Settings → General → Network settings → Advanced settings
-//   3. Set username/password in the Xbox Device Portal
-//
-// You can also set these env vars instead of flags:
-//   XBOX_IP, XBOX_USER, XBOX_PASS
+// Set env vars to avoid typing credentials each time:
+//   export XBOX_IP=192.168.100.27
+//   export XBOX_BRIDGE_PORT=8765
 
+import * as https from "https";
+import * as http from "http";
+import * as fs from "fs";
 import * as path from "path";
 import { DevicePortalClient } from "../src/xbox/device-portal";
 
-const args = process.argv.slice(2);
-const getArg = (flag: string) => { const i = args.indexOf(flag); return i >= 0 ? args[i + 1] : undefined; };
-const hasFlag = (flag: string) => args.includes(flag);
+const args      = process.argv.slice(2);
+const getArg    = (flag: string) => { const i = args.indexOf(flag); return i >= 0 ? args[i + 1] : undefined; };
+const hasFlag   = (flag: string) => args.includes(flag);
 
-const xboxIp   = getArg("--xbox-ip") ?? process.env.XBOX_IP;
-const username = getArg("--user")    ?? process.env.XBOX_USER;
-const password = getArg("--pass")    ?? process.env.XBOX_PASS;
+const xboxIp      = getArg("--xbox-ip")       ?? process.env.XBOX_IP;
+const bridgePort  = parseInt(getArg("--bridge-port") ?? process.env.XBOX_BRIDGE_PORT ?? "8765", 10);
+const username    = getArg("--user")           ?? process.env.XBOX_USER ?? "";
+const password    = getArg("--pass")           ?? process.env.XBOX_PASS ?? "";
+const useBridge   = !getArg("--user") && !process.env.XBOX_USER; // use SaveBridge if no WDP creds
 
-if (!xboxIp || !username || !password) {
+if (!xboxIp) {
   console.error(`
-Error: --xbox-ip, --user, and --pass are required (or set XBOX_IP / XBOX_USER / XBOX_PASS env vars).
+Error: --xbox-ip is required (or set XBOX_IP env var).
 
-Usage:
-  npx ts-node tools/save-sync.ts --download --xbox-ip 192.168.1.X --user admin --pass mypass
-  npx ts-node tools/save-sync.ts --upload   --input ./edited.sav --xbox-ip 192.168.1.X --user admin --pass mypass
-  npx ts-node tools/save-sync.ts --list     --xbox-ip 192.168.1.X --user admin --pass mypass
+SaveBridge mode (recommended — requires SaveBridge UWP on Xbox):
+  npx ts-node tools/save-sync.ts --download --xbox-ip 192.168.100.27
+  npx ts-node tools/save-sync.ts --list     --xbox-ip 192.168.100.27
+  npx ts-node tools/save-sync.ts --upload   --input ./edited.sav --xbox-ip 192.168.100.27
+
+Device Portal mode:
+  npx ts-node tools/save-sync.ts --download --xbox-ip 192.168.100.27 --user DevToolsUser --pass PASSWORD
+
+  See xbox-companion-app/README.md for SaveBridge setup.
 `);
   process.exit(1);
 }
 
-const client = new DevicePortalClient({ xboxIp, username, password });
+// ── SaveBridge HTTP client (talks to UWP app running on Xbox) ────────────────
+
+async function bridgeRequest(
+  method: string,
+  xboxIp: string,
+  port: number,
+  urlPath: string,
+  body?: Buffer
+): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const options: http.RequestOptions = {
+      hostname: xboxIp,
+      port,
+      path: urlPath,
+      method,
+      headers: body ? { "Content-Length": body.length, "Content-Type": "application/octet-stream" } : {},
+    };
+    const req = http.request(options, (res) => {
+      const chunks: Buffer[] = [];
+      res.on("data", (c) => chunks.push(c));
+      res.on("end", () => {
+        const buf = Buffer.concat(chunks);
+        if ((res.statusCode ?? 0) >= 400) reject(new Error(`HTTP ${res.statusCode}: ${buf.toString("utf8").slice(0, 200)}`));
+        else resolve(buf);
+      });
+    });
+    req.on("error", reject);
+    if (body) req.write(body);
+    req.end();
+  });
+}
+
+const client = username ? new DevicePortalClient({ xboxIp, username, password }) : null;
 
 async function main(): Promise<void> {
   console.log(`Connecting to Xbox Device Portal at https://${xboxIp}:11443 ...`);
