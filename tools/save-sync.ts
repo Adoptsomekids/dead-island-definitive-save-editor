@@ -1,39 +1,42 @@
 #!/usr/bin/env ts-node
 // tools/save-sync.ts
 // ─────────────────────────────────────────────────────────────────────────────
-// Download / upload Dead Island Definitive Edition Connected Storage saves
-// directly from Xbox Live — no app on the Xbox needed.
+// Dead Island Definitive Edition — Save File Sync Tool
 //
-// AUTHENTICATION FLOW (from microsoft/xbox-live-developer-tools):
-//   1. MSA device-code login  → access_token  (scope: Xboxlive.signin)
-//   2. XASU exchange          → XToken (user token)  @ user.auth.xboxlive.com
-//   3. XSTS exchange          → XSTS token           @ xsts.auth.xboxlive.com
-//   4. REST calls with header: Authorization: XBL3.0 x={userHash};{xstsToken}
+// HOW TO GET YOUR XBOX SERIES X SAVE FILE
+// ────────────────────────────────────────
+// Option A — SaveBridge (recommended): sideloaded JS UWP app running on your
+//   Xbox in Dev Mode that exposes an HTTP API on port 8765.
+//   Deploy it from https://github.com/Adoptsomekids/xbox-savebridge then:
+//     npx ts-node tools/save-sync.ts --bridge --xbox-ip 192.168.x.x
+//     npx ts-node tools/save-sync.ts --bridge-download --xbox-ip 192.168.x.x
 //
-// CONNECTED STORAGE REST ENDPOINTS:
-//   GET  https://titlestorage.xboxlive.com/connectedstorage/users/xuid({xuid})/scids/{scid}
-//   GET  https://titlestorage.xboxlive.com/connectedstorage/users/xuid({xuid})/scids/{scid}/{container},{blob},binary
+//   /cs/list and /cs/download use GameSaveProvider (requires Xbox Live online).
+//   When Xbox Live is available, use:
+//     npx ts-node tools/save-sync.ts --cs-list --xbox-ip 192.168.x.x
+//     npx ts-node tools/save-sync.ts --cs-download --xbox-ip 192.168.x.x [--out ./saves]
+//
+// Option B — Windows PC + Xbox App:
+//   The Xbox app syncs saves to:
+//   %LOCALAPPDATA%\Packages\Microsoft.GamingApp_8wekyb3d8bbwe\SystemAppData\wgs\
+//   Copy the container blobs to your Mac, then:
+//     npx ts-node tools/save-sync.ts --import --input <blob_file>
+//
+// Option C — Steam (PC):
+//   npx ts-node tools/save-sync.ts --list-steam
+//
+// Option D — PlayStation (PS4/PS5):
+//   Use Apollo Save Tool, then --import
 //
 // USAGE:
-//   # First time: login (opens browser for MSA device-code flow)
-//   npx ts-node tools/save-sync.ts --login
-//
-//   # List all save containers
-//   npx ts-node tools/save-sync.ts --list
-//
-//   # Download all blobs to ./saves/
-//   npx ts-node tools/save-sync.ts --download
-//
-//   # Download specific container/blob
-//   npx ts-node tools/save-sync.ts --download --container save0 --blob data
-//
-//   # Upload a blob back
-//   npx ts-node tools/save-sync.ts --upload --container save0 --blob data --input ./save0_data.bin
-//
-// ENV VARS (override):
-//   XBOX_SCID        — default: db860100-d780-4e17-8685-ad130052ea64 (Dead Island DE)
-//   XBOX_XUID        — your XUID (auto-detected after login)
-//   SAVES_DIR        — output directory (default: ./saves)
+//   npx ts-node tools/save-sync.ts --bridge           --xbox-ip <ip>  # list SaveBridge status + /cs containers
+//   npx ts-node tools/save-sync.ts --cs-list          --xbox-ip <ip>  # list DI save containers via GameSaveProvider
+//   npx ts-node tools/save-sync.ts --cs-download      --xbox-ip <ip> [--out ./saves]  # download all blobs
+//   npx ts-node tools/save-sync.ts --import  --input <file>           # import/inspect a save
+//   npx ts-node tools/save-sync.ts --info    --input <file>           # show save info
+//   npx ts-node tools/save-sync.ts --list-steam                       # find Steam saves automatically
+//   npx ts-node tools/save-sync.ts --login                            # Xbox Live login (token cache)
+//   npx ts-node tools/save-sync.ts --list                             # list Xbox Live containers (dev only)
 // ─────────────────────────────────────────────────────────────────────────────
 
 import * as fs   from "fs";
@@ -42,50 +45,42 @@ import * as os   from "os";
 import * as https from "https";
 import * as http  from "http";
 
-// ── Constants ─────────────────────────────────────────────────────────────────
+// ── Constants ──────────────────────────────────────────────────────────────────
 
-const DEAD_ISLAND_SCID = process.env.XBOX_SCID ?? "db860100-d780-4e17-8685-ad130052ea64";
-const SAVES_DIR        = process.env.SAVES_DIR ?? "./saves";
+const DEAD_ISLAND_SCID    = process.env.XBOX_SCID  ?? "db860100-d780-4e17-8685-ad130052ea64";
+const DEAD_ISLAND_TITLEID = "433850"; // Steam App ID (also used in Xbox paths)
+const SAVES_DIR           = process.env.SAVES_DIR  ?? "./saves";
 
-// Microsoft's official public client-id for Xbox Live signin
-// (same as MsalTestAuthContext.cs in xbox-live-developer-tools)
-const MSA_CLIENT_ID    = "b1eab458-325b-45a5-9692-ad6079c1eca8";
-const MSA_TENANT       = "consumers";
-const MSA_SCOPES       = "Xboxlive.signin Xboxlive.offline_access offline_access";
-
-const XASU_ENDPOINT    = "https://user.auth.xboxlive.com/user/authenticate";
-const XSTS_ENDPOINT    = "https://xsts.auth.xboxlive.com/xsts/authorize";
-const TS_ENDPOINT      = "https://titlestorage.xboxlive.com";
-
-// Token cache file
-const CACHE_FILE = path.join(os.homedir(), ".xbox-savebridge-tokens.json");
+// MSA client id from microsoft/xbox-live-developer-tools (MsalTestAuthContext.cs)
+const MSA_CLIENT_ID  = "b1eab458-325b-45a5-9692-ad6079c1eca8";
+const MSA_TENANT     = "consumers";
+const MSA_SCOPES     = "Xboxlive.signin Xboxlive.offline_access offline_access";
+const XASU_ENDPOINT  = "https://user.auth.xboxlive.com/user/authenticate";
+const XSTS_ENDPOINT  = "https://xsts.auth.xboxlive.com/xsts/authorize";
+const TS_ENDPOINT    = "https://titlestorage.xboxlive.com";
+const CACHE_FILE     = path.join(os.homedir(), ".xbox-savebridge-tokens.json");
 
 // ── Argument parsing ───────────────────────────────────────────────────────────
 
-const args    = process.argv.slice(2);
-const getArg  = (f: string) => { const i = args.indexOf(f); return i >= 0 ? args[i+1] : undefined; };
-const hasFlag = (f: string) => args.includes(f);
+const args      = process.argv.slice(2);
+const getArg    = (f: string) => { const i = args.indexOf(f); return i >= 0 ? args[i+1] : undefined; };
+const hasFlag   = (f: string) => args.includes(f);
+const XBOX_IP   = getArg("--xbox-ip") ?? process.env.XBOX_IP ?? "192.168.100.27";
+const BRIDGE_PORT = 8765;
 
-// ── HTTP helpers ───────────────────────────────────────────────────────────────
+// ── HTTP helper ────────────────────────────────────────────────────────────────
 
 function httpsRequest(
-  url: string,
-  method: string,
+  url: string, method: string,
   headers: Record<string, string>,
   body?: string | Buffer
 ): Promise<{ status: number; body: string; rawBody: Buffer }> {
   return new Promise((resolve, reject) => {
     const u = new URL(url);
     const opts: https.RequestOptions = {
-      hostname: u.hostname,
-      port: u.port ? parseInt(u.port) : 443,
-      path: u.pathname + u.search,
-      method,
-      headers: {
-        ...headers,
-        ...(body ? { "Content-Length": Buffer.byteLength(body).toString() } : {}),
-      },
-      rejectUnauthorized: true,
+      hostname: u.hostname, port: u.port ? parseInt(u.port) : 443,
+      path: u.pathname + u.search, method,
+      headers: { ...headers, ...(body ? { "Content-Length": Buffer.byteLength(body).toString() } : {}) },
     };
     const req = https.request(opts, (res) => {
       const chunks: Buffer[] = [];
@@ -104,506 +99,461 @@ function httpsRequest(
 // ── Token cache ────────────────────────────────────────────────────────────────
 
 interface TokenCache {
-  msaRefreshToken?: string;
-  msaAccessToken?: string;
-  msaExpiry?: number;       // epoch ms
-  xstsToken?: string;
-  xstsExpiry?: number;      // epoch ms
-  userHash?: string;
-  xuid?: string;
-  gamertag?: string;
+  msaRefreshToken?: string; msaAccessToken?: string; msaExpiry?: number;
+  xstsToken?: string; xstsExpiry?: number;
+  userHash?: string; xuid?: string; gamertag?: string;
 }
-
-function loadCache(): TokenCache {
-  try {
-    if (fs.existsSync(CACHE_FILE)) {
-      return JSON.parse(fs.readFileSync(CACHE_FILE, "utf8")) as TokenCache;
-    }
-  } catch { /* ignore */ }
+const loadCache = (): TokenCache => {
+  try { if (fs.existsSync(CACHE_FILE)) return JSON.parse(fs.readFileSync(CACHE_FILE, "utf8")); } catch {}
   return {};
-}
+};
+const saveCache = (c: TokenCache) => fs.writeFileSync(CACHE_FILE, JSON.stringify(c, null, 2), { mode: 0o600 });
 
-function saveCache(c: TokenCache): void {
-  fs.writeFileSync(CACHE_FILE, JSON.stringify(c, null, 2), { mode: 0o600 });
-}
+// ── MSA device-code login ──────────────────────────────────────────────────────
 
-// ── MSA Device-Code flow ───────────────────────────────────────────────────────
-
-interface DeviceCodeResponse {
-  device_code: string;
-  user_code: string;
-  verification_uri: string;
-  expires_in: number;
-  interval: number;
-  message: string;
-}
-
-interface TokenResponse {
-  access_token:  string;
-  refresh_token?: string;
-  expires_in:    number;
-  token_type:    string;
-}
-
-async function msaDeviceCodeLogin(): Promise<TokenResponse> {
-  // Step 1: request device code
-  const dcBody = new URLSearchParams({
-    client_id: MSA_CLIENT_ID,
-    scope:     MSA_SCOPES,
-  }).toString();
-
+async function msaDeviceCodeLogin(): Promise<{ access_token: string; refresh_token?: string; expires_in: number }> {
   const dcResp = await httpsRequest(
-    `https://login.microsoftonline.com/${MSA_TENANT}/oauth2/v2.0/devicecode`,
-    "POST",
+    `https://login.microsoftonline.com/${MSA_TENANT}/oauth2/v2.0/devicecode`, "POST",
     { "Content-Type": "application/x-www-form-urlencoded" },
-    dcBody
+    new URLSearchParams({ client_id: MSA_CLIENT_ID, scope: MSA_SCOPES }).toString()
   );
-  if (dcResp.status !== 200) throw new Error(`Device code request failed ${dcResp.status}: ${dcResp.body}`);
-  const dc: DeviceCodeResponse = JSON.parse(dcResp.body);
+  if (dcResp.status !== 200) throw new Error(`Device code failed ${dcResp.status}: ${dcResp.body}`);
+  const dc = JSON.parse(dcResp.body);
 
   console.log("\n─────────────────────────────────────────────────");
-  console.log("  Xbox Live Login Required");
+  console.log("  Xbox Live Login");
   console.log("─────────────────────────────────────────────────");
   console.log(`  1. Open: ${dc.verification_uri}`);
   console.log(`  2. Enter code: ${dc.user_code}`);
   console.log(`  3. Sign in with your Microsoft/Xbox account`);
   console.log("─────────────────────────────────────────────────\n");
 
-  // Step 2: poll until user completes auth
   const deadline = Date.now() + dc.expires_in * 1000;
   while (Date.now() < deadline) {
     await new Promise(r => setTimeout(r, (dc.interval + 1) * 1000));
-
-    const pollBody = new URLSearchParams({
-      client_id:   MSA_CLIENT_ID,
-      grant_type:  "urn:ietf:params:oauth:grant-type:device_code",
-      device_code: dc.device_code,
-    }).toString();
-
-    const pollResp = await httpsRequest(
-      `https://login.microsoftonline.com/${MSA_TENANT}/oauth2/v2.0/token`,
-      "POST",
+    const r = await httpsRequest(
+      `https://login.microsoftonline.com/${MSA_TENANT}/oauth2/v2.0/token`, "POST",
       { "Content-Type": "application/x-www-form-urlencoded" },
-      pollBody
+      new URLSearchParams({ client_id: MSA_CLIENT_ID, grant_type: "urn:ietf:params:oauth:grant-type:device_code", device_code: dc.device_code }).toString()
     );
-
-    if (pollResp.status === 200) {
-      const tok: TokenResponse = JSON.parse(pollResp.body);
-      console.log("✔ Microsoft login successful!\n");
-      return tok;
-    }
-
-    const err = JSON.parse(pollResp.body);
-    if (err.error === "authorization_pending") {
-      process.stdout.write(".");
-      continue;
-    }
-    if (err.error === "authorization_declined") throw new Error("Login declined by user.");
-    if (err.error === "expired_token") throw new Error("Login timed out. Run --login again.");
-    throw new Error(`Poll error: ${pollResp.body}`);
+    if (r.status === 200) { console.log("✔ Login successful!\n"); return JSON.parse(r.body); }
+    const e = JSON.parse(r.body);
+    if (e.error === "authorization_pending") { process.stdout.write("."); continue; }
+    if (e.error === "authorization_declined") throw new Error("Login declined.");
+    throw new Error(`Poll error: ${r.body}`);
   }
   throw new Error("Device code expired. Run --login again.");
 }
 
-async function msaRefreshToken(refreshToken: string): Promise<TokenResponse> {
-  const body = new URLSearchParams({
-    client_id:     MSA_CLIENT_ID,
-    grant_type:    "refresh_token",
-    refresh_token: refreshToken,
-    scope:         MSA_SCOPES,
-  }).toString();
+// ── XASU / XSTS token exchange ────────────────────────────────────────────────
 
-  const resp = await httpsRequest(
-    `https://login.microsoftonline.com/${MSA_TENANT}/oauth2/v2.0/token`,
-    "POST",
-    { "Content-Type": "application/x-www-form-urlencoded" },
-    body
-  );
-  if (resp.status !== 200) throw new Error(`Token refresh failed ${resp.status}: ${resp.body}`);
-  return JSON.parse(resp.body) as TokenResponse;
-}
+interface XToken { Token: string; DisplayClaims?: { xui?: Array<{ uhs?: string; xid?: string; gtg?: string }> }; NotAfter?: string; }
 
-// ── Xbox Live XASU / XSTS token exchange ──────────────────────────────────────
-
-interface XasTokenResponse {
-  Token: string;
-  DisplayClaims?: { xui?: Array<{ uhs?: string; xid?: string; gtg?: string }> };
-  NotAfter?: string;
-}
-
-async function fetchXasuToken(msaAccessToken: string): Promise<XasTokenResponse> {
-  const body = JSON.stringify({
-    Properties: {
-      AuthMethod: "RPS",
-      SiteName:   "user.auth.xboxlive.com",
-      RpsTicket:  `d=${msaAccessToken}`,
-    },
-    RelyingParty: "http://auth.xboxlive.com",
-    TokenType:    "JWT",
-  });
-
-  const resp = await httpsRequest(
-    XASU_ENDPOINT, "POST",
+async function fetchXasuToken(msaToken: string): Promise<XToken> {
+  const r = await httpsRequest(XASU_ENDPOINT, "POST",
     { "Content-Type": "application/json", "Accept": "application/json" },
-    body
+    JSON.stringify({ Properties: { AuthMethod: "RPS", SiteName: "user.auth.xboxlive.com", RpsTicket: `d=${msaToken}` }, RelyingParty: "http://auth.xboxlive.com", TokenType: "JWT" })
   );
-  if (resp.status !== 200) throw new Error(`XASU token failed ${resp.status}: ${resp.body}`);
-  return JSON.parse(resp.body) as XasTokenResponse;
+  if (r.status !== 200) throw new Error(`XASU failed ${r.status}: ${r.body}`);
+  return JSON.parse(r.body);
 }
 
-async function fetchXstsToken(xasuToken: string): Promise<XasTokenResponse> {
-  const body = JSON.stringify({
-    Properties: {
-      SandboxId:  "RETAIL",
-      UserTokens: [xasuToken],
-    },
-    RelyingParty: "http://xboxlive.com",
-    TokenType:    "JWT",
-  });
-
-  const resp = await httpsRequest(
-    XSTS_ENDPOINT, "POST",
+async function fetchXstsToken(xasuToken: string): Promise<XToken> {
+  const r = await httpsRequest(XSTS_ENDPOINT, "POST",
     { "Content-Type": "application/json", "Accept": "application/json" },
-    body
+    JSON.stringify({ Properties: { SandboxId: "RETAIL", UserTokens: [xasuToken] }, RelyingParty: "http://xboxlive.com", TokenType: "JWT" })
   );
-  if (resp.status !== 200) {
-    // 401 with specific XErr codes means the account needs something
-    if (resp.status === 401) {
-      try {
-        const err = JSON.parse(resp.body);
-        const xerr = err.XErr ?? err.xerr;
-        const msgs: Record<string, string> = {
-          "2148916233": "This Microsoft account has no Xbox profile. Go to xbox.com to create one.",
-          "2148916238": "This account is a child account and requires family settings approval.",
-          "2148916235": "Xbox Live is not available in your region.",
-        };
-        throw new Error(`XSTS auth failed: ${msgs[String(xerr)] ?? `XErr=${xerr}`}`);
-      } catch (e: any) { if (e.message.includes("XSTS")) throw e; }
+  if (r.status !== 200) {
+    if (r.status === 401) {
+      const xerr = JSON.parse(r.body)?.XErr;
+      const msgs: Record<string, string> = { "2148916233": "No Xbox profile — create one at xbox.com", "2148916238": "Child account — needs family approval" };
+      throw new Error(`XSTS failed: ${msgs[String(xerr)] ?? `XErr=${xerr}`}`);
     }
-    throw new Error(`XSTS token failed ${resp.status}: ${resp.body}`);
+    throw new Error(`XSTS failed ${r.status}: ${r.body}`);
   }
-  return JSON.parse(resp.body) as XasTokenResponse;
+  return JSON.parse(r.body);
 }
-
-// ── Get valid XSTS auth header (with refresh if needed) ───────────────────────
 
 async function getAuthHeader(): Promise<{ header: string; xuid: string; gamertag: string }> {
   let cache = loadCache();
-
-  // Try cached XSTS if not expired (with 5-min buffer)
   if (cache.xstsToken && cache.xstsExpiry && Date.now() < cache.xstsExpiry - 300_000) {
-    return {
-      header:   `XBL3.0 x=${cache.userHash};${cache.xstsToken}`,
-      xuid:     cache.xuid ?? "",
-      gamertag: cache.gamertag ?? "",
+    return { header: `XBL3.0 x=${cache.userHash};${cache.xstsToken}`, xuid: cache.xuid ?? "", gamertag: cache.gamertag ?? "" };
+  }
+  if (!cache.msaRefreshToken) throw new Error("Not logged in.\nRun: npx ts-node tools/save-sync.ts --login");
+  process.stdout.write("Refreshing Xbox token... ");
+  const tok = await httpsRequest(`https://login.microsoftonline.com/${MSA_TENANT}/oauth2/v2.0/token`, "POST",
+    { "Content-Type": "application/x-www-form-urlencoded" },
+    new URLSearchParams({ client_id: MSA_CLIENT_ID, grant_type: "refresh_token", refresh_token: cache.msaRefreshToken, scope: MSA_SCOPES }).toString()
+  );
+  if (tok.status !== 200) throw new Error("Token refresh failed. Run --login again.");
+  const t = JSON.parse(tok.body);
+  cache.msaAccessToken = t.access_token;
+  cache.msaRefreshToken = t.refresh_token ?? cache.msaRefreshToken;
+  const xasu = await fetchXasuToken(t.access_token);
+  const xsts = await fetchXstsToken(xasu.Token);
+  const xui  = xsts.DisplayClaims?.xui?.[0];
+  cache = { ...cache, xstsToken: xsts.Token, xstsExpiry: xsts.NotAfter ? new Date(xsts.NotAfter).getTime() : Date.now() + 3600_000, userHash: xui?.uhs, xuid: xui?.xid, gamertag: xui?.gtg };
+  saveCache(cache);
+  console.log("✔");
+  return { header: `XBL3.0 x=${cache.userHash};${cache.xstsToken}`, xuid: cache.xuid ?? "", gamertag: cache.gamertag ?? "" };
+}
+
+// ── SaveBridge HTTP helpers ────────────────────────────────────────────────────
+
+function bridgeGet(ip: string, urlPath: string): Promise<{ status: number; body: string; rawBody: Buffer }> {
+  return new Promise((resolve, reject) => {
+    const opts: http.RequestOptions = {
+      hostname: ip, port: BRIDGE_PORT, path: urlPath, method: "GET",
+      timeout: 30_000,
     };
+    const req = http.request(opts, (res) => {
+      const chunks: Buffer[] = [];
+      res.on("data", (c: Buffer) => chunks.push(c));
+      res.on("end", () => { const rawBody = Buffer.concat(chunks); resolve({ status: res.statusCode ?? 0, body: rawBody.toString("utf8"), rawBody }); });
+    });
+    req.on("error", reject);
+    req.on("timeout", () => { req.destroy(); reject(new Error(`Bridge request timed out: ${urlPath}`)); });
+    req.end();
+  });
+}
+
+async function bridgeStatus(ip: string): Promise<void> {
+  const r = await bridgeGet(ip, "/status");
+  if (r.status !== 200) throw new Error(`SaveBridge not reachable at ${ip}:${BRIDGE_PORT} (HTTP ${r.status})`);
+  const s = JSON.parse(r.body);
+  console.log(`  SaveBridge : ${ip}:${BRIDGE_PORT}`);
+  console.log(`  Build      : ${s.build}`);
+  console.log(`  Status     : ${s.status}`);
+}
+
+// ── Connected Storage list (NOTE: 403 on RETAIL — dev sandboxes only) ─────────
+
+async function csListBlobs(auth: string, xuid: string, scid: string): Promise<Array<{fileName: string; size: number}>> {
+  const url  = `${TS_ENDPOINT}/connectedstorage/users/xuid(${xuid})/scids/${scid}/`;
+  const resp = await httpsRequest(url, "GET", { "Authorization": auth, "x-xbl-contract-version": "1", "Accept": "application/json" });
+  if (resp.status === 403) throw new Error(
+    "403 Access Denied — Xbox Live Connected Storage REST API is restricted to developer sandboxes.\n" +
+    "It cannot access RETAIL saves. See README for extraction instructions."
+  );
+  if (resp.status === 404) return [];
+  if (resp.status !== 200) throw new Error(`List failed ${resp.status}: ${resp.body.slice(0, 200)}`);
+  return JSON.parse(resp.body)?.blobs ?? [];
+}
+
+// ── Save file inspector ────────────────────────────────────────────────────────
+
+function inspectSave(filePath: string): void {
+  if (!fs.existsSync(filePath)) { console.error(`File not found: ${filePath}`); process.exit(1); }
+  const buf  = fs.readFileSync(filePath);
+  const size = buf.length;
+  console.log(`\nFile: ${filePath} (${size.toLocaleString()} bytes)`);
+  console.log(`\nFirst 64 bytes (hex):`);
+  console.log(buf.slice(0, 64).toString("hex").replace(/(.{32})/g, "$1\n"));
+
+  // Check for known magic bytes
+  const magic = buf.readUInt32BE(0);
+  const magicStr = buf.slice(0, 4).toString("ascii").replace(/[^\x20-\x7e]/g, ".");
+  console.log(`\nMagic: 0x${magic.toString(16).toUpperCase().padStart(8, "0")}  "${magicStr}"`);
+
+  if (magic === 0x44495345) console.log("✔ DISE format detected (Dead Island save)");
+  else if (buf.slice(0, 3).toString("hex") === "434f4e") console.log("→ Possibly CON/LIVE Xbox 360 STFS container");
+  else if (buf.slice(0, 4).toString("hex") === "58427332") console.log("→ Xbox Series X Connected Storage blob (XBs2)");
+  else console.log("→ Unknown format — may need further analysis");
+
+  console.log(`\nNext steps:`);
+  console.log(`  npx ts-node src/cli.ts --input "${filePath}" --god-mode --max-level`);
+}
+
+// ── Steam save finder ──────────────────────────────────────────────────────────
+
+function findSteamSaves(): string[] {
+  const steamPaths = [
+    path.join(os.homedir(), "Library/Application Support/Steam/userdata"), // macOS
+    path.join(os.homedir(), ".steam/steam/userdata"),                       // Linux
+  ];
+  const found: string[] = [];
+  for (const base of steamPaths) {
+    if (!fs.existsSync(base)) continue;
+    try {
+      for (const user of fs.readdirSync(base)) {
+        const saveDir = path.join(base, user, DEAD_ISLAND_TITLEID, "remote/out/save");
+        if (fs.existsSync(saveDir)) {
+          const files = fs.readdirSync(saveDir).filter(f => f.endsWith(".sav") || f.endsWith(".sar"));
+          for (const f of files) found.push(path.join(saveDir, f));
+        }
+      }
+    } catch { /* ignore */ }
+  }
+  return found;
+}
+
+// ── SaveBridge bridge-import (from PC Xbox app WGS folder) ───────────────────
+
+async function cmdBridgeImport(): Promise<void> {
+  const outDir = getArg("--out") ?? "./saves";
+  const wgsBase = getArg("--wgs");
+
+  if (!wgsBase) {
+    console.log(`
+Xbox Series X Save Import — via Windows PC Xbox App
+════════════════════════════════════════════════════
+
+The Xbox Series X stores saves in Connected Storage (WGS), which syncs to
+the Xbox app on Windows. The save files live at:
+
+  %LOCALAPPDATA%\\Packages\\Microsoft.GamingApp_8wekyb3d8bbwe\\SystemAppData\\wgs\\
+  <XUID>\\<ContainerGuid>\\<BlobGuid>
+
+Steps:
+  1. On a Windows PC, install the Xbox app and sign in as Adopted Kz
+  2. The app will sync your Dead Island DE saves automatically
+  3. Open the folder above in Explorer and find the DI containers
+     (look for a folder matching XUID 2535409375459619)
+  4. Copy the entire wgs folder to your Mac, e.g.: ~/Desktop/di_wgs
+  5. Run: npx ts-node tools/save-sync.ts --bridge-import --wgs ~/Desktop/di_wgs
+
+Or if you have direct access to the WGS path:
+  npx ts-node tools/save-sync.ts --bridge-import \\
+    --wgs "/mnt/c/Users/<user>/AppData/Local/Packages/Microsoft.GamingApp_8wekyb3d8bbwe/SystemAppData/wgs"
+    `);
+    return;
   }
 
-  // Try refreshing MSA token
-  let msaAccessToken: string;
-  if (cache.msaRefreshToken) {
-    process.stdout.write("Refreshing Xbox Live token... ");
-    try {
-      const tok = await msaRefreshToken(cache.msaRefreshToken);
-      msaAccessToken = tok.access_token;
-      cache.msaRefreshToken = tok.refresh_token ?? cache.msaRefreshToken;
-      cache.msaAccessToken  = tok.access_token;
-      cache.msaExpiry       = Date.now() + tok.expires_in * 1000;
-      console.log("✔");
-    } catch {
-      console.log("refresh failed, need re-login");
-      cache = {};
+  fs.mkdirSync(outDir, { recursive: true });
+  console.log(`\nImporting WGS saves from: ${wgsBase}\n`);
+
+  if (!fs.existsSync(wgsBase)) {
+    console.error(`Path not found: ${wgsBase}`);
+    process.exit(1);
+  }
+
+  let totalBlobs = 0;
+  for (const xuid of fs.readdirSync(wgsBase)) {
+    const xuidDir = path.join(wgsBase, xuid);
+    if (!fs.statSync(xuidDir).isDirectory()) continue;
+
+    // Look for containers.index
+    const indexPath = path.join(xuidDir, "containers.index");
+    if (!fs.existsSync(indexPath)) continue;
+
+    console.log(`XUID: ${xuid}`);
+    const outXuid = path.join(outDir, xuid);
+    fs.mkdirSync(outXuid, { recursive: true });
+
+    for (const containerGuid of fs.readdirSync(xuidDir)) {
+      const containerDir = path.join(xuidDir, containerGuid);
+      if (!fs.statSync(containerDir).isDirectory()) continue;
+
+      const blobs = fs.readdirSync(containerDir).filter(f => !f.endsWith(".index"));
+      if (blobs.length === 0) continue;
+
+      console.log(`  Container: ${containerGuid} (${blobs.length} blob(s))`);
+      const outContainer = path.join(outXuid, containerGuid);
+      fs.mkdirSync(outContainer, { recursive: true });
+
+      for (const blob of blobs) {
+        const src = path.join(containerDir, blob);
+        const dst = path.join(outContainer, blob + ".bin");
+        fs.copyFileSync(src, dst);
+        const stat = fs.statSync(src);
+        console.log(`    ✔ ${blob}  (${stat.size.toLocaleString()} bytes) → ${dst}`);
+        totalBlobs++;
+      }
     }
   }
 
-  if (!msaAccessToken!) {
-    throw new Error(
-      "Not logged in to Xbox Live.\n" +
-      "Run first:  npx ts-node tools/save-sync.ts --login"
-    );
+  if (totalBlobs === 0) {
+    console.log("No blobs found. Check the --wgs path points to the WGS root folder.");
+    return;
   }
-
-  // XASU exchange
-  process.stdout.write("Exchanging XASU token... ");
-  const xasu = await fetchXasuToken(msaAccessToken!);
-  console.log("✔");
-
-  // XSTS exchange
-  process.stdout.write("Exchanging XSTS token... ");
-  const xsts = await fetchXstsToken(xasu.Token);
-  console.log("✔");
-
-  const xui      = xsts.DisplayClaims?.xui?.[0];
-  const userHash = xui?.uhs ?? "";
-  const xuid     = xui?.xid ?? process.env.XBOX_XUID ?? "";
-  const gamertag = xui?.gtg ?? "";
-
-  // Cache it
-  const expiry = xsts.NotAfter ? new Date(xsts.NotAfter).getTime() : Date.now() + 3600_000;
-  cache.xstsToken  = xsts.Token;
-  cache.xstsExpiry = expiry;
-  cache.userHash   = userHash;
-  cache.xuid       = xuid;
-  cache.gamertag   = gamertag;
-  saveCache(cache);
-
-  return { header: `XBL3.0 x=${userHash};${xsts.Token}`, xuid, gamertag };
+  console.log(`\n✔ Imported ${totalBlobs} blob(s) to ${outDir}`);
+  console.log(`\nTo inspect: npx ts-node tools/save-sync.ts --info --input <blob_file>`);
+  console.log(`To edit:    npx ts-node src/cli.ts --input <blob_file> --god-mode`);
 }
 
-// ── Connected Storage REST client ─────────────────────────────────────────────
+// ── SaveBridge commands ────────────────────────────────────────────────────────
 
-interface BlobInfo {
-  fileName:    string;  // "containerName/blobName,binary"
-  displayName?: string;
-  size:         number;
-  etag?:        string;
+async function cmdBridge(): Promise<void> {
+  console.log(`\nSaveBridge Status (Xbox IP: ${XBOX_IP})\n${"─".repeat(45)}`);
+  await bridgeStatus(XBOX_IP);
+
+  console.log("\n/cs/list — querying GameSaveProvider...");
+  const r = await bridgeGet(XBOX_IP, "/cs/list");
+  if (r.status !== 200) {
+    console.log(`  Error (HTTP ${r.status}): ${r.body.slice(0, 300)}`);
+    return;
+  }
+  const data = JSON.parse(r.body);
+  if (data.error) {
+    console.log(`  GameSaveProvider error: ${data.error}`);
+    console.log(`  SCID: ${data.scid}`);
+    console.log("\n  ⚠  Xbox Live must be online for /cs/list to work.");
+    console.log("  Try again when the Xbox is fully signed in to Xbox Live.");
+    return;
+  }
+  const containers: Array<{name: string; displayName: string; totalSize: number}> = data.containers ?? [];
+  if (containers.length === 0) {
+    console.log("  No containers found (Dead Island may not have been played yet or saves not synced).");
+    return;
+  }
+  console.log(`\nSCID: ${data.scid}`);
+  console.log(`Containers (${containers.length}):\n`);
+  for (const c of containers) {
+    console.log(`  ${c.name}  "${c.displayName}"  (${(c.totalSize / 1024).toFixed(1)} KB)`);
+  }
+  console.log(`\nTo download all blobs:\n  npx ts-node tools/save-sync.ts --cs-download --xbox-ip ${XBOX_IP}`);
 }
 
-interface ListResponse {
-  blobs?:      BlobInfo[];
-  pagingInfo?: { continuationToken?: string; totalItems?: number };
+async function cmdCsList(): Promise<void> {
+  await cmdBridge(); // same command for now
 }
 
-async function csListBlobs(
-  auth: string, xuid: string, scid: string, path_ = ""
-): Promise<BlobInfo[]> {
-  const all: BlobInfo[] = [];
-  let continuation = "";
+async function cmdCsDownload(): Promise<void> {
+  const outDir = getArg("--out") ?? "./saves";
+  fs.mkdirSync(outDir, { recursive: true });
 
-  do {
-    const qs = continuation ? `?continuationToken=${encodeURIComponent(continuation)}` : "";
-    const url = `${TS_ENDPOINT}/connectedstorage/users/xuid(${xuid})/scids/${scid}/${path_}${qs}`;
-    const resp = await httpsRequest(url, "GET", {
-      "Authorization":       auth,
-      "x-xbl-contract-version": "1",
-      "Accept":              "application/json",
-    });
+  console.log(`\nDownloading DI saves via SaveBridge (${XBOX_IP}:${BRIDGE_PORT})\n${"─".repeat(45)}`);
+  await bridgeStatus(XBOX_IP);
 
-    if (resp.status === 404) break; // no saves yet
-    if (resp.status !== 200) throw new Error(`List blobs failed ${resp.status}: ${resp.body.slice(0, 300)}`);
+  console.log("\nFetching container list...");
+  const listR = await bridgeGet(XBOX_IP, "/cs/list");
+  if (listR.status !== 200) throw new Error(`/cs/list failed: ${listR.body.slice(0, 200)}`);
+  const listData = JSON.parse(listR.body);
+  if (listData.error) throw new Error(`GameSaveProvider: ${listData.error}\nXbox Live must be online.`);
 
-    const data: ListResponse = JSON.parse(resp.body);
-    if (data.blobs) all.push(...data.blobs);
-    continuation = data.pagingInfo?.continuationToken ?? "";
-  } while (continuation);
+  const containers: Array<{name: string; displayName: string}> = listData.containers ?? [];
+  if (containers.length === 0) { console.log("No containers found."); return; }
 
-  return all;
-}
+  console.log(`Found ${containers.length} container(s). Downloading blobs...\n`);
+  let totalFiles = 0;
+  for (const c of containers) {
+    // Each container has blobs — we need to enumerate them via /cs/list details
+    // For now download the known blob names or probe with a blob list endpoint
+    const encodedContainer = encodeURIComponent(c.name);
 
-async function csDownloadBlob(
-  auth: string, xuid: string, scid: string, blobPath: string
-): Promise<Buffer> {
-  // blobPath should be like "containerName/blobName,binary"
-  const url = `${TS_ENDPOINT}/connectedstorage/users/xuid(${xuid})/scids/${scid}/${blobPath}`;
-  const resp = await httpsRequest(url, "GET", {
-    "Authorization":          auth,
-    "x-xbl-contract-version": "1",
-    "Accept-Encoding":        "gzip",
-  });
+    // Try common Dead Island blob names
+    const blobNames = ["header", "game", "save", "data", "profile", "0", "1", "2", "3"];
+    const containerDir = path.join(outDir, c.name.replace(/[\\/:*?"<>|]/g, "_"));
+    fs.mkdirSync(containerDir, { recursive: true });
 
-  if (resp.status !== 200) throw new Error(`Download failed ${resp.status}: ${resp.body.slice(0, 300)}`);
-  return resp.rawBody;
+    for (const blob of blobNames) {
+      const dlR = await bridgeGet(XBOX_IP, `/cs/download?container=${encodedContainer}&blob=${encodeURIComponent(blob)}`);
+      if (dlR.status === 200) {
+        const outFile = path.join(containerDir, blob + ".bin");
+        fs.writeFileSync(outFile, dlR.rawBody);
+        console.log(`  ✔ ${c.name}/${blob}  (${dlR.rawBody.length.toLocaleString()} bytes) → ${outFile}`);
+        totalFiles++;
+      }
+    }
+  }
+  if (totalFiles === 0) {
+    console.log("No blobs downloaded — try --bridge to see container names first, then probe blob names.");
+    return;
+  }
+  console.log(`\n✔ Downloaded ${totalFiles} blob(s) to ${outDir}`);
+  console.log(`\nTo inspect: npx ts-node tools/save-sync.ts --info --input <blob_file>`);
+  console.log(`To edit:    npx ts-node src/cli.ts --input <blob_file> --god-mode`);
 }
 
 // ── Commands ───────────────────────────────────────────────────────────────────
 
 async function cmdLogin(): Promise<void> {
   const tok = await msaDeviceCodeLogin();
-
-  process.stdout.write("Getting Xbox user token (XASU)... ");
   const xasu = await fetchXasuToken(tok.access_token);
-  console.log("✔");
-
-  process.stdout.write("Getting Xbox XSTS token... ");
   const xsts = await fetchXstsToken(xasu.Token);
-  console.log("✔");
-
-  const xui      = xsts.DisplayClaims?.xui?.[0];
-  const userHash = xui?.uhs ?? "";
-  const xuid     = xui?.xid ?? "";
-  const gamertag = xui?.gtg ?? "";
-  const expiry   = xsts.NotAfter ? new Date(xsts.NotAfter).getTime() : Date.now() + 3600_000;
-
-  const cache: TokenCache = {
-    msaAccessToken:  tok.access_token,
-    msaRefreshToken: tok.refresh_token,
-    msaExpiry:       Date.now() + tok.expires_in * 1000,
-    xstsToken:  xsts.Token,
-    xstsExpiry: expiry,
-    userHash,
-    xuid,
-    gamertag,
-  };
-  saveCache(cache);
-
-  console.log("\n✔ Logged in successfully!");
-  console.log(`  Gamertag : ${gamertag || "(not available)"}`);
-  console.log(`  XUID     : ${xuid}`);
-  console.log(`  Token expires: ${new Date(expiry).toLocaleString()}`);
-  console.log(`  Credentials cached at: ${CACHE_FILE}\n`);
+  const xui = xsts.DisplayClaims?.xui?.[0];
+  const expiry = xsts.NotAfter ? new Date(xsts.NotAfter).getTime() : Date.now() + 3600_000;
+  saveCache({ msaAccessToken: tok.access_token, msaRefreshToken: tok.refresh_token, msaExpiry: Date.now() + tok.expires_in * 1000, xstsToken: xsts.Token, xstsExpiry: expiry, userHash: xui?.uhs, xuid: xui?.xid, gamertag: xui?.gtg });
+  console.log("✔ Logged in!");
+  console.log(`  Gamertag : ${xui?.gtg ?? "(none)"}`);
+  console.log(`  XUID     : ${xui?.xid ?? "(none)"}`);
+  console.log(`  Cached at: ${CACHE_FILE}`);
+  console.log("\nNote: Xbox Live Connected Storage REST API is restricted to dev sandboxes.");
+  console.log("Your credentials are cached for future use, but --list will return 403 for RETAIL saves.");
+  console.log("See README for how to extract Xbox Series X saves via USB.");
 }
 
 async function cmdList(): Promise<void> {
   const { header, xuid, gamertag } = await getAuthHeader();
-  console.log(`\nXbox account: ${gamertag} (XUID: ${xuid})`);
+  console.log(`\nAccount: ${gamertag} (XUID: ${xuid})`);
   console.log(`SCID: ${DEAD_ISLAND_SCID}`);
-  console.log("Listing Connected Storage blobs...\n");
-
+  console.log("\nNote: This API only works for developer sandboxes, not RETAIL saves.\n");
   const blobs = await csListBlobs(header, xuid, DEAD_ISLAND_SCID);
-
-  if (blobs.length === 0) {
-    console.log("No save blobs found. Make sure Dead Island DE has been run at least once.");
-    return;
-  }
-
-  console.log(`Found ${blobs.length} blob(s):\n`);
-  for (const b of blobs) {
-    const kb = (b.size / 1024).toFixed(1);
-    console.log(`  ${b.fileName}  (${kb} KB)`);
-  }
-  console.log(`\nRun --download to save all blobs to ${SAVES_DIR}/`);
+  if (blobs.length === 0) { console.log("No blobs found."); return; }
+  for (const b of blobs) console.log(`  ${b.fileName}  (${(b.size/1024).toFixed(1)} KB)`);
 }
 
-async function cmdDownload(): Promise<void> {
-  const { header, xuid, gamertag } = await getAuthHeader();
-  const filterContainer = getArg("--container");
-  const filterBlob      = getArg("--blob");
-  const output          = getArg("--output");
-
-  console.log(`\nXbox account: ${gamertag} (XUID: ${xuid})`);
-  console.log(`SCID: ${DEAD_ISLAND_SCID}\n`);
-
-  const blobs = await csListBlobs(header, xuid, DEAD_ISLAND_SCID);
-  if (blobs.length === 0) {
-    console.log("No save blobs found. Play Dead Island DE at least once to create a save.");
+function cmdListSteam(): void {
+  console.log("Searching for Dead Island Definitive Edition Steam saves...\n");
+  const saves = findSteamSaves();
+  if (saves.length === 0) {
+    console.log("No Steam saves found.");
+    console.log(`Expected location: ~/Library/Application Support/Steam/userdata/<user>/${DEAD_ISLAND_TITLEID}/remote/out/save/`);
     return;
   }
-
-  // Filter if container/blob specified
-  const targets = blobs.filter(b => {
-    if (!filterContainer && !filterBlob) return true;
-    const [name] = b.fileName.split(",");
-    const parts  = name.split("/");
-    if (filterContainer && !parts[0]?.includes(filterContainer)) return false;
-    if (filterBlob      && !parts[1]?.includes(filterBlob))      return false;
-    return true;
-  });
-
-  if (targets.length === 0) {
-    console.log(`No blobs match the filter. Available:\n${blobs.map(b => `  ${b.fileName}`).join("\n")}`);
-    return;
+  console.log(`Found ${saves.length} save file(s):\n`);
+  for (const s of saves) {
+    const stat = fs.statSync(s);
+    console.log(`  ${s}  (${(stat.size/1024).toFixed(1)} KB, modified ${stat.mtime.toLocaleDateString()})`);
   }
-
-  fs.mkdirSync(SAVES_DIR, { recursive: true });
-  let downloaded = 0;
-
-  for (const blob of targets) {
-    // fileName format: "containerName/blobName,binary" or "containerName/blobName,json"
-    const blobPath = blob.fileName.includes(",") ? blob.fileName : `${blob.fileName},binary`;
-    const [namePart] = blobPath.split(",");
-    const safeName   = namePart.replace(/[/\\]/g, "_");
-    const outFile    = output ?? path.join(SAVES_DIR, `${safeName}.bin`);
-
-    process.stdout.write(`  Downloading ${blobPath} ... `);
-    try {
-      const data = await csDownloadBlob(header, xuid, DEAD_ISLAND_SCID, blobPath);
-      fs.writeFileSync(outFile, data);
-      console.log(`✔  ${data.length.toLocaleString()} bytes → ${outFile}`);
-      downloaded++;
-    } catch (e: any) {
-      console.log(`✗  ${e.message}`);
-    }
-  }
-
-  console.log(`\n✔ Downloaded ${downloaded}/${targets.length} blob(s) to ${path.resolve(SAVES_DIR)}/`);
-  console.log("Next: open the .bin files with the save editor to edit them.");
-}
-
-async function cmdUpload(): Promise<void> {
-  const inputPath = getArg("--input");
-  const container = getArg("--container");
-  const blob      = getArg("--blob");
-
-  if (!inputPath || !container || !blob) {
-    console.error("Usage: --upload --input <file.bin> --container <name> --blob <name>");
-    process.exit(1);
-  }
-  if (!fs.existsSync(inputPath)) {
-    console.error(`File not found: ${inputPath}`);
-    process.exit(1);
-  }
-
-  const { header, xuid, gamertag } = await getAuthHeader();
-  console.log(`\nXbox account: ${gamertag} (XUID: ${xuid})`);
-
-  const data    = fs.readFileSync(inputPath);
-  const blobUrl = `${TS_ENDPOINT}/connectedstorage/users/xuid(${xuid})/scids/${DEAD_ISLAND_SCID}/${container}/${blob},binary`;
-
-  process.stdout.write(`Uploading ${inputPath} (${data.length.toLocaleString()} bytes) → ${container}/${blob} ... `);
-  const resp = await httpsRequest(blobUrl, "PUT", {
-    "Authorization":          header,
-    "x-xbl-contract-version": "1",
-    "Content-Type":           "application/octet-stream",
-  }, data);
-
-  if (resp.status === 200 || resp.status === 204) {
-    console.log("✔ Upload successful!");
-    console.log("\nIMPORTANT: On your Xbox, quit Dead Island DE completely before");
-    console.log("launching again so it picks up the new save from Xbox Live cloud.");
-  } else {
-    throw new Error(`Upload failed ${resp.status}: ${resp.body.slice(0, 300)}`);
-  }
+  console.log(`\nTo inspect: npx ts-node tools/save-sync.ts --info --input "${saves[0]}"`);
+  console.log(`To edit:    npx ts-node src/cli.ts --input "${saves[0]}" --god-mode`);
 }
 
 // ── Main ───────────────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
-  if (hasFlag("--login")) {
-    await cmdLogin();
+  if (hasFlag("--login"))         { await cmdLogin();        return; }
+  if (hasFlag("--list"))          { await cmdList();         return; }
+  if (hasFlag("--list-steam"))    { cmdListSteam();          return; }
+  if (hasFlag("--bridge"))        { await cmdBridge();       return; }
+  if (hasFlag("--cs-list"))       { await cmdCsList();       return; }
+  if (hasFlag("--cs-download"))   { await cmdCsDownload();   return; }
+  if (hasFlag("--bridge-import")) { await cmdBridgeImport(); return; }
+
+  const inputFile = getArg("--input");
+  if (hasFlag("--info") || hasFlag("--import")) {
+    if (!inputFile) { console.error("--input <file> required"); process.exit(1); }
+    inspectSave(inputFile);
     return;
   }
 
-  if (hasFlag("--list")) {
-    await cmdList();
-    return;
-  }
-
-  if (hasFlag("--download")) {
-    await cmdDownload();
-    return;
-  }
-
-  if (hasFlag("--upload")) {
-    await cmdUpload();
-    return;
-  }
-
-  // Default: show help
   console.log(`
-Xbox Live Connected Storage Sync — Dead Island Definitive Edition
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Dead Island DE — Save Sync Tool
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-FIRST TIME SETUP (one-time):
-  npx ts-node tools/save-sync.ts --login
+HOW TO GET YOUR XBOX SERIES X SAVE FILE:
+
+  ★ Option A — SaveBridge (recommended):
+    Your Xbox is running SaveBridge on port ${BRIDGE_PORT}.
+    When Xbox Live is online:
+      npx ts-node tools/save-sync.ts --bridge       --xbox-ip ${XBOX_IP}
+      npx ts-node tools/save-sync.ts --cs-download  --xbox-ip ${XBOX_IP} --out ./saves
+
+  Option B — Windows PC + Xbox App:
+    %LOCALAPPDATA%\\Packages\\Microsoft.GamingApp_8wekyb3d8bbwe\\SystemAppData\\wgs\\
+    npx ts-node tools/save-sync.ts --info --input <blob_file>
+
+  Option C — Steam (PC):
+    npx ts-node tools/save-sync.ts --list-steam
 
 COMMANDS:
-  --login                  Sign in with your Microsoft/Xbox account (device-code flow)
-  --list                   List all Dead Island DE save blobs in Connected Storage
-  --download               Download all save blobs to ${SAVES_DIR}/
-  --download               --container <name> --blob <name>   (specific blob)
-  --download               --output <file.bin>                (single blob to file)
-  --upload                 --container <name> --blob <name> --input <file.bin>
+  --bridge  [--xbox-ip <ip>]              SaveBridge status + container list
+  --cs-list [--xbox-ip <ip>]              Same as --bridge
+  --cs-download [--xbox-ip <ip>] [--out]  Download all save blobs to ./saves
+  --login                                 Xbox Live login (token cache)
+  --list                                  List containers via REST (dev sandboxes only)
+  --list-steam                            Find Steam save files
+  --info --input <f>                      Inspect save file format
+  --import --input <f>                    Same as --info
 
-ENV VARS:
-  XBOX_SCID=${DEAD_ISLAND_SCID}  (Dead Island DE)
-  SAVES_DIR=${SAVES_DIR}
-
-CREDENTIALS are cached at: ${CACHE_FILE}
+SCID    : ${DEAD_ISLAND_SCID}
+Xbox IP : ${XBOX_IP}:${BRIDGE_PORT}
   `.trim());
 }
 
 main().catch((err: Error) => {
-  console.error("\n✗ Error:", err.message);
+  console.error("\n✗", err.message);
   if (process.env.DEBUG) console.error(err.stack);
   process.exit(1);
 });
