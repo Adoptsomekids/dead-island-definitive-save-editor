@@ -1,0 +1,14 @@
+{
+  "atoms": [
+    {
+      "name": "GUID",
+      "atom": "C48AF0F0-D4FF-4891-90F7-9CC8A84B73A8",
+      "size": 16
+    },
+    {
+      "name": "PROFILE_DATA",
+      "atom": "BDE638D4-8379-4867-A706-4E05EEAA0CBD",
+      "size": 2304
+    }
+  ]
+}

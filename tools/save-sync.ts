@@ -5,60 +5,76 @@
 //
 // HOW TO GET YOUR XBOX SERIES X SAVE FILE
 // ────────────────────────────────────────
-// Option A — SaveBridge (recommended): sideloaded JS UWP app running on your
-//   Xbox in Dev Mode that exposes an HTTP API on port 8765.
+// Option A — cs-pull (recommended, no Xbox needed):
+//   Uses device+title+XSTS token chain to pull from Xbox Live Connected Storage
+//   (titlestorage.xboxlive.com) directly to your Mac — no SaveBridge required.
+//     npx ts-node tools/save-sync.ts --login                 # one-time auth
+//     npx ts-node tools/save-sync.ts --cs-pull               # list containers
+//     npx ts-node tools/save-sync.ts --cs-pull --out ./saves # download blobs
+//
+// Option B — SaveBridge (Xbox in Dev Mode):
+//   Sideloaded JS UWP app running on your Xbox that exposes HTTP on port 8765.
 //   Deploy it from https://github.com/Adoptsomekids/xbox-savebridge then:
 //     npx ts-node tools/save-sync.ts --bridge --xbox-ip 192.168.x.x
-//     npx ts-node tools/save-sync.ts --bridge-download --xbox-ip 192.168.x.x
-//
-//   /cs/list and /cs/download use GameSaveProvider (requires Xbox Live online).
-//   When Xbox Live is available, use:
-//     npx ts-node tools/save-sync.ts --cs-list --xbox-ip 192.168.x.x
 //     npx ts-node tools/save-sync.ts --cs-download --xbox-ip 192.168.x.x [--out ./saves]
 //
-// Option B — Windows PC + Xbox App:
+// Option C — Windows PC + Xbox App:
 //   The Xbox app syncs saves to:
 //   %LOCALAPPDATA%\Packages\Microsoft.GamingApp_8wekyb3d8bbwe\SystemAppData\wgs\
 //   Copy the container blobs to your Mac, then:
-//     npx ts-node tools/save-sync.ts --import --input <blob_file>
+//     npx ts-node tools/save-sync.ts --bridge-import --wgs <path>
 //
-// Option C — Steam (PC):
+// Option D — Steam (PC):
 //   npx ts-node tools/save-sync.ts --list-steam
 //
-// Option D — PlayStation (PS4/PS5):
-//   Use Apollo Save Tool, then --import
-//
 // USAGE:
-//   npx ts-node tools/save-sync.ts --bridge           --xbox-ip <ip>  # list SaveBridge status + /cs containers
-//   npx ts-node tools/save-sync.ts --cs-list          --xbox-ip <ip>  # list DI save containers via GameSaveProvider
-//   npx ts-node tools/save-sync.ts --cs-download      --xbox-ip <ip> [--out ./saves]  # download all blobs
+//   npx ts-node tools/save-sync.ts --login                             # Xbox Live login (token cache)
+//   npx ts-node tools/save-sync.ts --cs-pull [--out ./saves] [--scid SCID]  # ★ pull saves from Xbox Live
+//   npx ts-node tools/save-sync.ts --cs-push --input <file> [--blob-name <name>]  # push save to Xbox Live
+//   npx ts-node tools/save-sync.ts --bridge           --xbox-ip <ip>  # SaveBridge status + containers
+//   npx ts-node tools/save-sync.ts --cs-list          --xbox-ip <ip>  # same as --bridge
+//   npx ts-node tools/save-sync.ts --cs-download      --xbox-ip <ip> [--out ./saves]
+//   npx ts-node tools/save-sync.ts --bridge-import --wgs <path>       # import from PC Xbox app WGS folder
 //   npx ts-node tools/save-sync.ts --import  --input <file>           # import/inspect a save
 //   npx ts-node tools/save-sync.ts --info    --input <file>           # show save info
 //   npx ts-node tools/save-sync.ts --list-steam                       # find Steam saves automatically
-//   npx ts-node tools/save-sync.ts --login                            # Xbox Live login (token cache)
-//   npx ts-node tools/save-sync.ts --list                             # list Xbox Live containers (dev only)
+//   npx ts-node tools/save-sync.ts --list                             # list via REST (dev sandboxes only)
 // ─────────────────────────────────────────────────────────────────────────────
 
-import * as fs   from "fs";
-import * as path from "path";
-import * as os   from "os";
-import * as https from "https";
-import * as http  from "http";
+import * as fs     from "fs";
+import * as path   from "path";
+import * as os     from "os";
+import * as https  from "https";
+import * as http   from "http";
+import * as crypto from "crypto";
+import * as child_process from "child_process";
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 
 const DEAD_ISLAND_SCID    = process.env.XBOX_SCID  ?? "db860100-d780-4e17-8685-ad130052ea64";
 const DEAD_ISLAND_TITLEID = "433850"; // Steam App ID (also used in Xbox paths)
+const DEAD_ISLAND_PFN     = "DeepSilver.DeadIslandDefinitiveEdition_hmv7qcest37me";
 const SAVES_DIR           = process.env.SAVES_DIR  ?? "./saves";
 
 // MSA client id from microsoft/xbox-live-developer-tools (MsalTestAuthContext.cs)
 const MSA_CLIENT_ID  = "b1eab458-325b-45a5-9692-ad6079c1eca8";
 const MSA_TENANT     = "consumers";
 const MSA_SCOPES     = "Xboxlive.signin Xboxlive.offline_access offline_access";
-const XASU_ENDPOINT  = "https://user.auth.xboxlive.com/user/authenticate";
-const XSTS_ENDPOINT  = "https://xsts.auth.xboxlive.com/xsts/authorize";
-const TS_ENDPOINT    = "https://titlestorage.xboxlive.com";
-const CACHE_FILE     = path.join(os.homedir(), ".xbox-savebridge-tokens.json");
+
+// Legacy Xbox Live client — used for device token auth
+// login.live.com + service::user.auth.xboxlive.com::MBI_SSL scope
+const LIVE_CLIENT_ID    = "000000004c12ae6f";
+const LIVE_SCOPE        = "service::user.auth.xboxlive.com::MBI_SSL";
+const LIVE_TOKEN_URL    = "https://login.live.com/oauth20_token.srf";
+const LIVE_AUTH_URL     = "https://login.live.com/oauth20_authorize.srf";
+const LIVE_REDIRECT_URI = "https://login.live.com/oauth20_desktop.srf";
+
+const XASU_ENDPOINT   = "https://user.auth.xboxlive.com/user/authenticate";
+const DEVICE_ENDPOINT = "https://device.auth.xboxlive.com/device/authenticate";
+const TITLE_ENDPOINT  = "https://title.auth.xboxlive.com/title/authenticate";
+const XSTS_ENDPOINT   = "https://xsts.auth.xboxlive.com/xsts/authorize";
+const TS_ENDPOINT     = "https://titlestorage.xboxlive.com";
+const CACHE_FILE      = path.join(os.homedir(), ".xbox-savebridge-tokens.json");
 
 // ── Argument parsing ───────────────────────────────────────────────────────────
 
@@ -102,6 +118,14 @@ interface TokenCache {
   msaRefreshToken?: string; msaAccessToken?: string; msaExpiry?: number;
   xstsToken?: string; xstsExpiry?: number;
   userHash?: string; xuid?: string; gamertag?: string;
+  // legacy login.live.com token (for device+title token auth)
+  liveAccessToken?: string; liveRefreshToken?: string; liveExpiry?: number;
+  // full-auth chain tokens (device+title+XSTS)
+  userToken?: string;
+  deviceToken?: string; deviceTokenExpiry?: number;
+  titleToken?: string; titleTokenExpiry?: number;
+  fullXstsToken?: string; fullXstsExpiry?: number;
+  fullUserHash?: string;
 }
 const loadCache = (): TokenCache => {
   try { if (fs.existsSync(CACHE_FILE)) return JSON.parse(fs.readFileSync(CACHE_FILE, "utf8")); } catch {}
@@ -145,6 +169,151 @@ async function msaDeviceCodeLogin(): Promise<{ access_token: string; refresh_tok
   throw new Error("Device code expired. Run --login again.");
 }
 
+// ── Legacy MSA (login.live.com) — needed for device token ─────────────────────
+
+/** Open a browser and start a local helper page to capture the legacy MSA token
+ *  (login.live.com, client 000000004c12ae6f, scope service::MBI_SSL).
+ *  Uses implicit token flow with the registered desktop redirect URI.
+ *  The local page extracts the access_token from the URL fragment. */
+async function legacyLiveLogin(): Promise<{ access_token: string; refresh_token?: string; expires_in: number }> {
+  const localPort = 7777;
+  const localRedirect = `http://localhost:${localPort}/live_callback`;
+  const desktopUri = "https://login.live.com/oauth20_desktop.srf";
+
+  // We use implicit flow (response_type=token) with the registered desktop redirect.
+  // After login, login.live.com redirects to oauth20_desktop.srf#access_token=...
+  // We host a local page that the user visits to extract the token from the URL they were redirected to.
+  const authUrl = LIVE_AUTH_URL + "?" + new URLSearchParams({
+    client_id:     LIVE_CLIENT_ID,
+    response_type: "token",
+    redirect_uri:  desktopUri,   // ← registered redirect URI
+    scope:         LIVE_SCOPE,
+    display:       "touch",
+    locale:        "en",
+  }).toString();
+
+  const helpPage = `<!DOCTYPE html>
+<html><head><title>Xbox Live Auth Helper</title>
+<style>body{font-family:monospace;padding:20px;background:#1a1a1a;color:#81c784;}</style>
+</head><body>
+<h2>Xbox Live Auth Helper</h2>
+<p>After signing in to Microsoft, you will be redirected to a page like:<br>
+<code>https://login.live.com/oauth20_desktop.srf#access_token=...</code></p>
+<p><strong>Copy the FULL URL from your browser's address bar after login, then paste it below:</strong></p>
+<textarea id="url" style="width:100%;height:80px;background:#222;color:#aaa;font-size:12px;" placeholder="Paste the full redirect URL here (https://login.live.com/oauth20_desktop.srf#access_token=...)"></textarea>
+<br><br>
+<button onclick="submit()" style="padding:8px 16px;background:#3b82d4;color:white;border:none;cursor:pointer">Extract Token</button>
+<pre id="result" style="margin-top:20px;"></pre>
+<script>
+function submit() {
+  var url = document.getElementById('url').value.trim();
+  if (!url.includes('access_token=')) { document.getElementById('result').textContent = 'No access_token found in URL!'; return; }
+  // Parse fragment
+  var frag = url.split('#')[1] || '';
+  var params = {};
+  frag.split('&').forEach(function(p) { var kv = p.split('='); params[kv[0]] = decodeURIComponent(kv[1] || ''); });
+  if (!params.access_token) { document.getElementById('result').textContent = 'Could not parse access_token!'; return; }
+  // Send to local server
+  fetch('/token', { method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({access_token: params.access_token, expires_in: parseInt(params.expires_in||'3600'), token_type: params.token_type})
+  }).then(function(r){ return r.text(); }).then(function(t) {
+    document.getElementById('result').textContent = t;
+  }).catch(function(e){ document.getElementById('result').textContent = 'Error: '+e; });
+}
+</script>
+</body></html>`;
+
+  console.log("\n─────────────────────────────────────────────────────────────");
+  console.log("  Legacy Xbox Live Login (for device token / full save download)");
+  console.log("─────────────────────────────────────────────────────────────");
+  console.log("  Step 1: Sign in at this URL (opens in browser):");
+  console.log(`\n  ${authUrl}\n`);
+  console.log("  Step 2: After signing in, copy the FULL redirect URL");
+  console.log("          (it will look like: https://login.live.com/oauth20_desktop.srf#access_token=...)");
+  console.log(`  Step 3: Paste it into the helper page at: http://localhost:${localPort}/`);
+  console.log("─────────────────────────────────────────────────────────────\n");
+
+  // Try to open the browser (sign-in URL first)
+  try {
+    const openCmd = process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open";
+    child_process.spawn(openCmd, [authUrl], { detached: true, stdio: "ignore" });
+  } catch { /* ignore */ }
+  // Small delay then open helper page
+  setTimeout(() => {
+    try {
+      const openCmd = process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open";
+      child_process.spawn(openCmd, [`http://localhost:${localPort}/`], { detached: true, stdio: "ignore" });
+    } catch {}
+  }, 2000);
+
+  return new Promise((resolve, reject) => {
+    const server = http.createServer((req, res) => {
+      const urlObj = new URL(req.url ?? "/", `http://localhost:${localPort}`);
+
+      if (urlObj.pathname === "/" || urlObj.pathname === "") {
+        res.writeHead(200, { "Content-Type": "text/html" });
+        res.end(helpPage);
+        return;
+      }
+
+      if (urlObj.pathname === "/token" && req.method === "POST") {
+        const chunks: Buffer[] = [];
+        req.on("data", (c: Buffer) => chunks.push(c));
+        req.on("end", () => {
+          try {
+            const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+            if (!body.access_token) {
+              res.writeHead(400, { "Content-Type": "text/plain" });
+              res.end("No access_token");
+              return;
+            }
+            res.writeHead(200, { "Content-Type": "text/plain" });
+            res.end("✔ Token received! You can close this window.\n\nCheck your terminal — download will start shortly.");
+            server.close();
+            console.log("✔ Legacy login successful!\n");
+            resolve({ access_token: body.access_token, expires_in: body.expires_in ?? 3600 });
+          } catch (e) {
+            res.writeHead(500, { "Content-Type": "text/plain" });
+            res.end("Parse error");
+            reject(e);
+          }
+        });
+        return;
+      }
+
+      res.writeHead(404);
+      res.end("Not found");
+    });
+
+    server.listen(localPort, "localhost", () => {
+      console.log(`Helper page ready at: http://localhost:${localPort}/`);
+      console.log("Waiting for token...");
+    });
+    server.on("error", reject);
+    setTimeout(() => {
+      server.close();
+      reject(new Error("Legacy login timed out. Run --login-legacy again."));
+    }, 300_000); // 5 min timeout
+  });
+}
+
+/** Refresh the legacy live token. */
+async function refreshLegacyToken(refreshToken: string): Promise<{ access_token: string; refresh_token?: string; expires_in: number }> {
+  const r = await httpsRequest(LIVE_TOKEN_URL, "POST",
+    { "Content-Type": "application/x-www-form-urlencoded",
+      "User-Agent": "Mozilla/5.0 (XboxReplay; XboxLiveAuth/3.0) AppleWebKit/537.36" },
+    new URLSearchParams({
+      client_id:     LIVE_CLIENT_ID,
+      refresh_token: refreshToken,
+      grant_type:    "refresh_token",
+      scope:         LIVE_SCOPE,
+      redirect_uri:  LIVE_REDIRECT_URI,
+    }).toString()
+  );
+  if (r.status !== 200) throw new Error(`Legacy token refresh failed ${r.status}: ${r.body.slice(0, 200)}`);
+  return JSON.parse(r.body);
+}
+
 // ── XASU / XSTS token exchange ────────────────────────────────────────────────
 
 interface XToken { Token: string; DisplayClaims?: { xui?: Array<{ uhs?: string; xid?: string; gtg?: string }> }; NotAfter?: string; }
@@ -172,6 +341,285 @@ async function fetchXstsToken(xasuToken: string): Promise<XToken> {
     throw new Error(`XSTS failed ${r.status}: ${r.body}`);
   }
   return JSON.parse(r.body);
+}
+
+// ── Full auth chain: Device + Title + XSTS (xbcsmgr method) ──────────────────
+// This is required to access ERA game connected storage (XGameSave) at:
+//   titlestorage.xboxlive.com/connectedstorage/users/xuid(...)/scids/...
+// The plain user XSTS token returns 403 NoAccess. Only the full triple-token
+// bundle (device + title + user in one XSTS) has the required entitlement.
+
+/** Generate an ECDSA P-256 Xbox Live Signature header value.
+ *  Layout (big-endian):
+ *   [4] policy version = 1
+ *   [1] null separator
+ *   [8] Windows timestamp (100-ns ticks since 1601-01-01)
+ *   [1] null separator
+ *   "POST\0{path+query}\0{authToken}\0{body}\0"
+ *  Signed with SHA-256 ECDSA (P-256), output:
+ *   [4] policy version (BE)
+ *   [8] Windows timestamp (BE)
+ *   [r 32 bytes][s 32 bytes]  (raw IEEE P1363 format, not DER)
+ */
+function xblSignature(
+  privateKey: crypto.KeyObject,
+  method: string,
+  url: string,
+  authToken: string,
+  body: string
+): string {
+  // Windows FILETIME: 100-ns ticks since 1601-01-01
+  // Match xbcsmgr exactly: (unixSeconds + 11644473600) * 10000000
+  const unixSeconds = BigInt(Math.floor(Date.now() / 1000));
+  const nowTicks    = (unixSeconds + 11644473600n) * 10000000n;
+
+  const policyVer = Buffer.alloc(4);
+  policyVer.writeUInt32BE(1, 0);
+  const tsBuf = Buffer.alloc(8);
+  tsBuf.writeBigUInt64BE(nowTicks, 0);
+
+  const urlObj     = new URL(url);
+  const pathQuery  = urlObj.pathname + urlObj.search;
+
+  const strPart = `${method.toUpperCase()}\0${pathQuery}\0${authToken}\0${body}\0`;
+  const strBuf  = Buffer.from(strPart, "ascii");
+
+  // Payload: [4] policyVer [1] 0x00 [8] ts [1] 0x00 [strPart bytes]
+  const payload = Buffer.concat([
+    policyVer, Buffer.alloc(1),
+    tsBuf,     Buffer.alloc(1),
+    strBuf
+  ]);
+
+  // Sign with raw ECDSA — Node returns DER-encoded ASN.1 r,s — we need IEEE P1363 (raw r||s)
+  const derSig  = crypto.sign("sha256", payload, { key: privateKey, dsaEncoding: "ieee-p1363" });
+
+  // Output: [4] policyVer [8] ts [64] r||s
+  const out = Buffer.concat([policyVer, tsBuf, derSig]);
+  return out.toString("base64");
+}
+
+/** Make a signed POST to an Xbox Live auth endpoint.
+ *  The "Signature" header is required by device/title endpoints. */
+async function signedXblPost(
+  url: string,
+  body: object,
+  authToken: string,
+  privateKey: crypto.KeyObject,
+  extraHeaders: Record<string, string> = {}
+): Promise<XToken> {
+  const bodyStr = JSON.stringify(body);
+  const sig     = xblSignature(privateKey, "POST", url, authToken, bodyStr);
+  const r = await httpsRequest(url, "POST", {
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+    "x-xbl-contract-version": "2",
+    "Signature": sig,
+    ...extraHeaders,
+  }, bodyStr);
+  if (r.status !== 200) throw new Error(`${url} → ${r.status}: ${r.body.slice(0, 300)}`);
+  return JSON.parse(r.body);
+}
+
+/** Obtain a Device token. Requires an MSA access token + a fresh ECDSA key pair.
+ *  The proof-key public coordinates are embedded in the request so the server
+ *  can verify the Signature on future calls. */
+async function fetchDeviceToken(
+  msaToken: string,
+  privateKey: crypto.KeyObject,
+  publicKey: crypto.KeyObject
+): Promise<XToken> {
+  // Export the raw x,y coordinates from the public key
+  const raw    = publicKey.export({ type: "spki", format: "der" });
+  // SPKI for P-256 is 91 bytes: 26-byte header + 1 uncompressed flag + 32 x + 32 y
+  const x = raw.slice(27, 59).toString("base64url");
+  const y = raw.slice(59, 91).toString("base64url");
+
+  const proofKey = { kty: "EC", alg: "ES256", use: "sig", crv: "P-256", x, y };
+
+  return signedXblPost(DEVICE_ENDPOINT, {
+    RelyingParty: "http://auth.xboxlive.com",
+    TokenType: "JWT",
+    Properties: {
+      AuthMethod: "RPS",
+      SiteName: "user.auth.xboxlive.com",
+      RpsTicket: `t=${msaToken}`,
+      ProofKey: proofKey,
+      Version: "0.0.0",
+    }
+  }, "", privateKey);
+}
+
+/** Obtain a Title token using the device token. */
+async function fetchTitleToken(
+  msaToken: string,
+  deviceToken: string,
+  privateKey: crypto.KeyObject
+): Promise<XToken> {
+  return signedXblPost(TITLE_ENDPOINT, {
+    RelyingParty: "http://auth.xboxlive.com",
+    TokenType: "JWT",
+    Properties: {
+      AuthMethod: "RPS",
+      SiteName: "user.auth.xboxlive.com",
+      DeviceToken: deviceToken,
+      RpsTicket: `t=${msaToken}`,
+    }
+  }, deviceToken, privateKey);
+}
+
+/** Exchange user+device+title tokens for a full XSTS token with connected-storage access. */
+async function fetchFullXsts(
+  userToken: string,
+  deviceToken: string,
+  titleToken: string
+): Promise<XToken> {
+  const r = await httpsRequest(XSTS_ENDPOINT, "POST",
+    { "Content-Type": "application/json", "Accept": "application/json", "x-xbl-contract-version": "1" },
+    JSON.stringify({
+      RelyingParty: "http://xboxlive.com",
+      TokenType: "JWT",
+      Properties: {
+        SandboxId: "RETAIL",
+        UserTokens: [userToken],
+        DeviceToken: deviceToken,
+        TitleToken: titleToken,
+      }
+    })
+  );
+  if (r.status !== 200) {
+    const xerr = (() => { try { return JSON.parse(r.body)?.XErr; } catch { return undefined; } })();
+    const msgs: Record<string, string> = {
+      "2148916233": "No Xbox profile — create one at xbox.com",
+      "2148916238": "Child account — needs family approval",
+      "2148916229": "Title access denied for this sandbox",
+    };
+    throw new Error(`Full XSTS failed ${r.status}: ${msgs[String(xerr)] ?? r.body.slice(0, 200)}`);
+  }
+  return JSON.parse(r.body);
+}
+
+/** Build a fresh ECDSA P-256 key pair (ephemeral per session, like xbcsmgr). */
+function generateP256KeyPair(): { privateKey: crypto.KeyObject; publicKey: crypto.KeyObject } {
+  return crypto.generateKeyPairSync("ec", { namedCurve: "prime256v1" });
+}
+
+/** Get the legacy MSA (login.live.com) access token, refreshing if needed.
+ *  Throws if no live token is cached — user must run --login-legacy first. */
+async function getLiveMsaToken(): Promise<string> {
+  let cache = loadCache();
+  if (cache.liveAccessToken && cache.liveExpiry && Date.now() < cache.liveExpiry - 300_000) {
+    return cache.liveAccessToken;
+  }
+  if (!cache.liveRefreshToken) {
+    throw new Error(
+      "Legacy Xbox Live token not found.\n" +
+      "Run: npx ts-node tools/save-sync.ts --login-legacy\n" +
+      "(opens a browser — sign in with the same account as your Xbox)"
+    );
+  }
+  process.stdout.write("Refreshing legacy Live token... ");
+  const tok = await refreshLegacyToken(cache.liveRefreshToken);
+  cache.liveAccessToken = tok.access_token;
+  cache.liveRefreshToken = tok.refresh_token ?? cache.liveRefreshToken;
+  cache.liveExpiry = Date.now() + tok.expires_in * 1000;
+  saveCache(cache);
+  console.log("✔");
+  return tok.access_token;
+}
+
+/** Get (or refresh) the full device+title+user XSTS chain.
+ *  Requires: --login (standard) AND --login-legacy (for device token).
+ *  Tokens are cached in the same ~/.xbox-savebridge-tokens.json. */
+async function getFullAuthHeader(): Promise<{ header: string; xuid: string; gamertag: string }> {
+  let cache = loadCache();
+  if (cache.fullXstsToken && cache.fullXstsExpiry && Date.now() < cache.fullXstsExpiry - 300_000) {
+    return {
+      header: `XBL3.0 x=${cache.fullUserHash};${cache.fullXstsToken}`,
+      xuid: cache.xuid ?? "",
+      gamertag: cache.gamertag ?? "",
+    };
+  }
+
+  // Ensure we have a valid MSA access token (modern MSAL for user token)
+  if (!cache.msaRefreshToken && !cache.msaAccessToken) {
+    throw new Error("Not logged in.\nRun: npx ts-node tools/save-sync.ts --login");
+  }
+
+  let msaAccess = cache.msaAccessToken ?? "";
+  const msaExpired = !cache.msaExpiry || Date.now() > cache.msaExpiry - 300_000;
+
+  if (msaExpired || !msaAccess) {
+    if (!cache.msaRefreshToken) throw new Error("MSA token expired. Run --login again.");
+    process.stdout.write("Refreshing MSA token... ");
+    const tok = await httpsRequest(
+      `https://login.microsoftonline.com/${MSA_TENANT}/oauth2/v2.0/token`, "POST",
+      { "Content-Type": "application/x-www-form-urlencoded" },
+      new URLSearchParams({
+        client_id: MSA_CLIENT_ID,
+        grant_type: "refresh_token",
+        refresh_token: cache.msaRefreshToken,
+        scope: MSA_SCOPES,
+      }).toString()
+    );
+    if (tok.status !== 200) throw new Error("MSA token refresh failed. Run --login again.");
+    const t = JSON.parse(tok.body);
+    msaAccess = t.access_token;
+    cache.msaAccessToken = msaAccess;
+    cache.msaRefreshToken = t.refresh_token ?? cache.msaRefreshToken;
+    cache.msaExpiry = Date.now() + t.expires_in * 1000;
+    saveCache(cache);
+    console.log("✔");
+  }
+
+  // Step 1: User token (uses modern MSAL token, d= prefix)
+  process.stdout.write("Fetching user token... ");
+  const userTok = await fetchXasuToken(msaAccess);
+  const userToken = userTok.Token;
+  console.log("✔");
+
+  // Step 2: Device + Title tokens — require legacy MBI_SSL token (t= prefix)
+  const { privateKey, publicKey } = generateP256KeyPair();
+  const liveToken = await getLiveMsaToken();
+
+  process.stdout.write("Fetching device token (ECDSA signed)... ");
+  const deviceTok = await fetchDeviceToken(liveToken, privateKey, publicKey);
+  const deviceToken = deviceTok.Token;
+  console.log("✔");
+
+  process.stdout.write("Fetching title token... ");
+  const titleTok = await fetchTitleToken(liveToken, deviceToken, privateKey);
+  const titleToken = titleTok.Token;
+  console.log("✔");
+
+  // Step 3: Full XSTS with all three
+  process.stdout.write("Exchanging for full XSTS... ");
+  const xsts    = await fetchFullXsts(userToken, deviceToken, titleToken);
+  const xui     = xsts.DisplayClaims?.xui?.[0];
+  const expiry  = xsts.NotAfter ? new Date(xsts.NotAfter).getTime() : Date.now() + 3600_000;
+  console.log("✔");
+
+  cache = {
+    ...cache,
+    userToken,
+    deviceToken,
+    deviceTokenExpiry: Date.now() + 3600_000,
+    titleToken,
+    titleTokenExpiry: Date.now() + 3600_000,
+    fullXstsToken: xsts.Token,
+    fullXstsExpiry: expiry,
+    fullUserHash: xui?.uhs,
+    // update user info from this claim if available
+    xuid: xui?.xid ?? cache.xuid,
+    gamertag: xui?.gtg ?? cache.gamertag,
+  };
+  saveCache(cache);
+
+  return {
+    header: `XBL3.0 x=${xui?.uhs};${xsts.Token}`,
+    xuid: xui?.xid ?? cache.xuid ?? "",
+    gamertag: xui?.gtg ?? cache.gamertag ?? "",
+  };
 }
 
 async function getAuthHeader(): Promise<{ header: string; xuid: string; gamertag: string }> {
@@ -226,18 +674,42 @@ async function bridgeStatus(ip: string): Promise<void> {
   console.log(`  Status     : ${s.status}`);
 }
 
-// ── Connected Storage list (NOTE: 403 on RETAIL — dev sandboxes only) ─────────
+// ── Connected Storage REST helpers ────────────────────────────────────────────
 
-async function csListBlobs(auth: string, xuid: string, scid: string): Promise<Array<{fileName: string; size: number}>> {
+/** List all blobs/containers in a SCID's connected storage.
+ *  With the full device+title+XSTS chain this works for RETAIL saves. */
+async function csListBlobs(auth: string, xuid: string, scid: string, pfn?: string): Promise<Array<{fileName: string; size: number; clientFileTime?: string; displayName?: string}>> {
   const url  = `${TS_ENDPOINT}/connectedstorage/users/xuid(${xuid})/scids/${scid}/`;
-  const resp = await httpsRequest(url, "GET", { "Authorization": auth, "x-xbl-contract-version": "1", "Accept": "application/json" });
+  const headers: Record<string, string> = {
+    "Authorization": auth,
+    "x-xbl-contract-version": "107",
+    "Accept": "application/json",
+  };
+  if (pfn) headers["x-xbl-pfn"] = pfn;
+  const resp = await httpsRequest(url, "GET", headers);
   if (resp.status === 403) throw new Error(
-    "403 Access Denied — Xbox Live Connected Storage REST API is restricted to developer sandboxes.\n" +
-    "It cannot access RETAIL saves. See README for extraction instructions."
+    `403 Access Denied — cannot list Connected Storage for SCID ${scid}\n` +
+    "Response: " + resp.body.slice(0, 300)
   );
   if (resp.status === 404) return [];
-  if (resp.status !== 200) throw new Error(`List failed ${resp.status}: ${resp.body.slice(0, 200)}`);
-  return JSON.parse(resp.body)?.blobs ?? [];
+  if (resp.status !== 200) throw new Error(`List failed ${resp.status}: ${resp.body.slice(0, 300)}`);
+  const parsed = JSON.parse(resp.body);
+  // response may have .blobs or .savedgames depending on endpoint
+  return parsed?.blobs ?? parsed?.savedgames ?? parsed?.items ?? [];
+}
+
+/** Download a single blob atom from connected storage. */
+async function csDownloadBlob(auth: string, xuid: string, scid: string, blobPath: string, pfn?: string): Promise<Buffer> {
+  const url  = `${TS_ENDPOINT}/connectedstorage/users/xuid(${xuid})/scids/${scid}/${blobPath}`;
+  const headers: Record<string, string> = {
+    "Authorization": auth,
+    "x-xbl-contract-version": "107",
+    "Accept": "*/*",
+  };
+  if (pfn) headers["x-xbl-pfn"] = pfn;
+  const resp = await httpsRequest(url, "GET", headers);
+  if (resp.status !== 200) throw new Error(`Download failed ${resp.status} for ${blobPath}: ${resp.body.slice(0, 200)}`);
+  return resp.rawBody;
 }
 
 // ── Save file inspector ────────────────────────────────────────────────────────
@@ -455,6 +927,205 @@ async function cmdCsDownload(): Promise<void> {
   console.log(`To edit:    npx ts-node src/cli.ts --input <blob_file> --god-mode`);
 }
 
+// ── cs-pull: pull saves directly from Xbox Live ────────────────────────────────
+// Phase 1: List blobs via standard XSTS + x-xbl-pfn header (no device token needed)
+// Phase 2: Resolve atom manifests via /savedgames/{name} (standard XSTS)
+// Phase 3: Download atom binaries via POST /atoms/{guid} → Azure SAS URL
+//          (requires device+title token — run --login-legacy first for Phase 3)
+
+/** Get a standard XSTS auth header (no device/title token). */
+async function getStandardAuthHeader(): Promise<{ header: string; xuid: string; gamertag: string }> {
+  let cache = loadCache();
+  if (cache.xstsToken && cache.xstsExpiry && Date.now() < cache.xstsExpiry - 300_000) {
+    return { header: `XBL3.0 x=${cache.userHash};${cache.xstsToken}`, xuid: cache.xuid ?? "", gamertag: cache.gamertag ?? "" };
+  }
+  if (!cache.msaRefreshToken && !cache.msaAccessToken) {
+    throw new Error("Not logged in.\nRun: npx ts-node tools/save-sync.ts --login");
+  }
+  let msaAccess = cache.msaAccessToken ?? "";
+  const msaExpired = !cache.msaExpiry || Date.now() > cache.msaExpiry - 300_000;
+  if (msaExpired || !msaAccess) {
+    if (!cache.msaRefreshToken) throw new Error("Token expired. Run --login.");
+    process.stdout.write("Refreshing MSA... ");
+    const tok = await httpsRequest(
+      `https://login.microsoftonline.com/${MSA_TENANT}/oauth2/v2.0/token`, "POST",
+      { "Content-Type": "application/x-www-form-urlencoded" },
+      new URLSearchParams({ client_id: MSA_CLIENT_ID, grant_type: "refresh_token",
+        refresh_token: cache.msaRefreshToken, scope: MSA_SCOPES }).toString()
+    );
+    if (tok.status !== 200) throw new Error("Token refresh failed. Run --login.");
+    const t = JSON.parse(tok.body);
+    msaAccess = t.access_token;
+    cache = { ...cache, msaAccessToken: msaAccess, msaRefreshToken: t.refresh_token ?? cache.msaRefreshToken,
+      msaExpiry: Date.now() + t.expires_in * 1000 };
+    saveCache(cache);
+    console.log("✔");
+  }
+  process.stdout.write("Getting XSTS... ");
+  const xasu = await fetchXasuToken(msaAccess);
+  const xsts = await fetchXstsToken(xasu.Token);
+  const xui  = xsts.DisplayClaims?.xui?.[0];
+  const expiry = xsts.NotAfter ? new Date(xsts.NotAfter).getTime() : Date.now() + 3600_000;
+  cache = { ...cache, xstsToken: xsts.Token, xstsExpiry: expiry,
+    userHash: xui?.uhs, xuid: xui?.xid, gamertag: xui?.gtg };
+  saveCache(cache);
+  console.log("✔");
+  return { header: `XBL3.0 x=${xui?.uhs};${xsts.Token}`, xuid: xui?.xid ?? "", gamertag: xui?.gtg ?? "" };
+}
+
+/** Get Azure Blob SAS URL for downloading an atom — requires device+title XSTS token. */
+async function getAtomDownloadUrl(
+  fullHeader: string,
+  xuid: string,
+  scid: string,
+  atomGuid: string,
+  size: number,
+  pfn: string
+): Promise<string> {
+  const url = `${TS_ENDPOINT}/connectedstorage/users/xuid(${xuid})/scids/${scid}/atoms/${encodeURIComponent(atomGuid + ",binary")}`;
+  const r = await httpsRequest(url, "POST",
+    { "Authorization": fullHeader, "x-xbl-contract-version": "107",
+      "Content-Type": "application/json", "Accept": "application/json", "x-xbl-pfn": pfn },
+    JSON.stringify({ size })
+  );
+  if (r.status !== 200) throw new Error(`atoms POST failed ${r.status}: ${r.body.slice(0, 200)}`);
+  const blobUri = JSON.parse(r.body)?.blobUri;
+  if (!blobUri) throw new Error(`No blobUri in response: ${r.body.slice(0, 100)}`);
+  return blobUri;
+}
+
+/** Download binary from Azure Blob Storage SAS URL. */
+function downloadFromSasUrl(sasUrl: string): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const urlObj = new URL(sasUrl);
+    const lib = urlObj.protocol === "https:" ? https : http;
+    const req = (lib as typeof https).request({ hostname: urlObj.hostname, path: urlObj.pathname + urlObj.search, method: "GET" }, (res) => {
+      const chunks: Buffer[] = [];
+      res.on("data", (c: Buffer) => chunks.push(c));
+      res.on("end", () => resolve(Buffer.concat(chunks)));
+    });
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+async function cmdCsPull(): Promise<void> {
+  const outDir  = getArg("--out");
+  const scid    = getArg("--scid") ?? DEAD_ISLAND_SCID;
+  const pfn     = getArg("--pfn") ?? DEAD_ISLAND_PFN;
+  const fullDownload = hasFlag("--full");
+
+  console.log(`\nDead Island DE — Connected Storage Pull`);
+  console.log(`${"─".repeat(45)}`);
+  console.log(`SCID : ${scid}`);
+  console.log(`PFN  : ${pfn}`);
+  console.log("");
+
+  // Phase 1: standard auth (works for listing)
+  const { header: stdHeader, xuid, gamertag } = await getStandardAuthHeader();
+  console.log(`✔ Authenticated as: ${gamertag} (XUID: ${xuid})\n`);
+
+  // Phase 2: list blobs with x-xbl-pfn header
+  console.log("Listing Connected Storage blobs (standard XSTS + x-xbl-pfn)...");
+  const blobs = await csListBlobs(stdHeader, xuid, scid, pfn);
+
+  if (blobs.length === 0) {
+    console.log("\n  No blobs found for this SCID.");
+    console.log("  Launch Dead Island DE on your Xbox and save the game first.");
+    return;
+  }
+
+  console.log(`\nFound ${blobs.length} blob(s):\n`);
+  for (const b of blobs) {
+    const sz = b.size ? `${(b.size / 1024).toFixed(1)} KB` : "(no size)";
+    const dt = (b as any).clientFileTime ? `  [${(b as any).clientFileTime.slice(0,10)}]` : "";
+    console.log(`  ${b.fileName ?? b.displayName ?? "(unnamed)"}  ${sz}${dt}`);
+  }
+
+  if (!outDir) {
+    console.log(`\nTo download save manifests (atom GUIDs):`);
+    console.log(`  npx ts-node tools/save-sync.ts --cs-pull --out ./saves`);
+    console.log(`\nTo download actual binary save data (requires --login-legacy first):`);
+    console.log(`  npx ts-node tools/save-sync.ts --login-legacy`);
+    console.log(`  npx ts-node tools/save-sync.ts --cs-pull --out ./saves --full`);
+    return;
+  }
+
+  fs.mkdirSync(outDir, { recursive: true });
+
+  // Phase 3: for each blob, get the savedgame manifest and download atoms
+  let savedFiles = 0;
+  for (const blob of blobs) {
+    const blobName = blob.fileName ?? blob.displayName ?? "";
+    if (!blobName) continue;
+
+    // Get the atom manifest via /savedgames/{name}
+    const saveName = blobName.replace(/,savedgame$/i, "");
+    const manifestUrl = `${TS_ENDPOINT}/connectedstorage/users/xuid(${xuid})/scids/${scid}/savedgames/${encodeURIComponent(saveName)}`;
+    const manifestR = await httpsRequest(manifestUrl, "GET", {
+      "Authorization": stdHeader, "x-xbl-contract-version": "107",
+      "Accept": "application/json", "x-xbl-pfn": pfn
+    });
+    if (manifestR.status !== 200) {
+      console.log(`  ✗ Manifest for ${saveName}: ${manifestR.status}`);
+      continue;
+    }
+    const manifest = JSON.parse(manifestR.body);
+    const atoms: Array<{name: string; atom: string; size: number}> = manifest.atoms ?? [];
+
+    // Save the manifest
+    const manifestFile = path.join(outDir, saveName.replace(/[\\/:*?"<>|]/g, "_") + "_manifest.json");
+    fs.writeFileSync(manifestFile, JSON.stringify(manifest, null, 2));
+    console.log(`  ✔ ${saveName} manifest → ${manifestFile}`);
+
+    if (!fullDownload) {
+      for (const a of atoms) {
+        console.log(`     Atom: ${a.name}  GUID: ${a.atom}  (${(a.size/1024).toFixed(1)} KB)`);
+      }
+      continue;
+    }
+
+    // Full download: get SAS URL for each atom and download binary
+    // This requires the full device+title token
+    let fullHeader: string;
+    try {
+      const fullAuth = await getFullAuthHeader();
+      fullHeader = fullAuth.header;
+    } catch (e: any) {
+      console.log(`\n  ⚠ Full atom download requires legacy login:`);
+      console.log(`    npx ts-node tools/save-sync.ts --login-legacy`);
+      console.log(`    Then: --cs-pull --out ./saves --full`);
+      return;
+    }
+
+    for (const a of atoms) {
+      try {
+        process.stdout.write(`    Downloading atom ${a.name} (${(a.size/1024).toFixed(1)} KB)... `);
+        const sasUrl = await getAtomDownloadUrl(fullHeader, xuid, scid, a.atom, a.size, pfn);
+        const binData = await downloadFromSasUrl(sasUrl);
+        const outFile = path.join(outDir, saveName.replace(/[\\/:*?"<>|]/g, "_") + "_" + a.name.replace(/[\\/:*?"<>|]/g, "_") + ".bin");
+        fs.writeFileSync(outFile, binData);
+        console.log(`✔  (${binData.length.toLocaleString()} bytes) → ${outFile}`);
+        savedFiles++;
+      } catch (e: any) {
+        console.log(`✗  ${(e as Error).message.slice(0, 100)}`);
+      }
+    }
+  }
+
+  if (!fullDownload) {
+    console.log(`\n✔ Saved ${blobs.length} manifest(s) to ${outDir}`);
+    console.log(`  Manifests contain the atom GUIDs for each save slot.`);
+    console.log(`  To download the actual binary save data:`);
+    console.log(`    npx ts-node tools/save-sync.ts --login-legacy`);
+    console.log(`    npx ts-node tools/save-sync.ts --cs-pull --out ${outDir} --full`);
+  } else {
+    console.log(`\n✔ Downloaded ${savedFiles} save atom(s) to ${outDir}`);
+    console.log(`\nTo inspect: npx ts-node tools/save-sync.ts --info --input <blob_file>`);
+    console.log(`To edit:    npx ts-node src/cli.ts --input <blob_file> --god-mode`);
+  }
+}
+
 // ── Commands ───────────────────────────────────────────────────────────────────
 
 async function cmdLogin(): Promise<void> {
@@ -463,14 +1134,29 @@ async function cmdLogin(): Promise<void> {
   const xsts = await fetchXstsToken(xasu.Token);
   const xui = xsts.DisplayClaims?.xui?.[0];
   const expiry = xsts.NotAfter ? new Date(xsts.NotAfter).getTime() : Date.now() + 3600_000;
-  saveCache({ msaAccessToken: tok.access_token, msaRefreshToken: tok.refresh_token, msaExpiry: Date.now() + tok.expires_in * 1000, xstsToken: xsts.Token, xstsExpiry: expiry, userHash: xui?.uhs, xuid: xui?.xid, gamertag: xui?.gtg });
+  const existing = loadCache();
+  saveCache({ ...existing, msaAccessToken: tok.access_token, msaRefreshToken: tok.refresh_token,
+    msaExpiry: Date.now() + tok.expires_in * 1000, xstsToken: xsts.Token, xstsExpiry: expiry,
+    userHash: xui?.uhs, xuid: xui?.xid, gamertag: xui?.gtg });
   console.log("✔ Logged in!");
   console.log(`  Gamertag : ${xui?.gtg ?? "(none)"}`);
   console.log(`  XUID     : ${xui?.xid ?? "(none)"}`);
   console.log(`  Cached at: ${CACHE_FILE}`);
-  console.log("\nNote: Xbox Live Connected Storage REST API is restricted to dev sandboxes.");
-  console.log("Your credentials are cached for future use, but --list will return 403 for RETAIL saves.");
-  console.log("See README for how to extract Xbox Series X saves via USB.");
+  console.log("\n✔ Run --cs-pull to list your save files (no extra steps needed).");
+  console.log("  For full binary download, also run --login-legacy.");
+}
+
+async function cmdLoginLegacy(): Promise<void> {
+  const existing = loadCache();
+  const tok = await legacyLiveLogin();
+  saveCache({ ...existing,
+    liveAccessToken: tok.access_token,
+    liveRefreshToken: tok.refresh_token,
+    liveExpiry: Date.now() + tok.expires_in * 1000,
+  });
+  console.log("✔ Legacy Xbox Live token cached!");
+  console.log(`  Cached at: ${CACHE_FILE}`);
+  console.log("\n✔ You can now run --cs-pull --out ./saves --full to download binary save data.");
 }
 
 async function cmdList(): Promise<void> {
@@ -504,6 +1190,8 @@ function cmdListSteam(): void {
 
 async function main(): Promise<void> {
   if (hasFlag("--login"))         { await cmdLogin();        return; }
+  if (hasFlag("--login-legacy"))  { await cmdLoginLegacy();  return; }
+  if (hasFlag("--cs-pull"))       { await cmdCsPull();       return; }
   if (hasFlag("--list"))          { await cmdList();         return; }
   if (hasFlag("--list-steam"))    { cmdListSteam();          return; }
   if (hasFlag("--bridge"))        { await cmdBridge();       return; }
@@ -524,30 +1212,38 @@ Dead Island DE — Save Sync Tool
 
 HOW TO GET YOUR XBOX SERIES X SAVE FILE:
 
-  ★ Option A — SaveBridge (recommended):
+  ★ Option A — cs-pull (no Xbox needed, direct cloud download):
+      npx ts-node tools/save-sync.ts --login          # one-time sign-in
+      npx ts-node tools/save-sync.ts --cs-pull        # list containers
+      npx ts-node tools/save-sync.ts --cs-pull --out ./saves  # download all
+
+  Option B — SaveBridge (Xbox in Dev Mode):
     Your Xbox is running SaveBridge on port ${BRIDGE_PORT}.
     When Xbox Live is online:
       npx ts-node tools/save-sync.ts --bridge       --xbox-ip ${XBOX_IP}
       npx ts-node tools/save-sync.ts --cs-download  --xbox-ip ${XBOX_IP} --out ./saves
 
-  Option B — Windows PC + Xbox App:
+  Option C — Windows PC + Xbox App:
     %LOCALAPPDATA%\\Packages\\Microsoft.GamingApp_8wekyb3d8bbwe\\SystemAppData\\wgs\\
-    npx ts-node tools/save-sync.ts --info --input <blob_file>
+    npx ts-node tools/save-sync.ts --bridge-import --wgs <path>
 
-  Option C — Steam (PC):
+  Option D — Steam (PC):
     npx ts-node tools/save-sync.ts --list-steam
 
 COMMANDS:
+  --login                                 Xbox Live sign-in (one-time, cached)
+  --cs-pull [--out ./saves] [--scid S]    ★ Pull saves directly from Xbox Live
   --bridge  [--xbox-ip <ip>]              SaveBridge status + container list
   --cs-list [--xbox-ip <ip>]              Same as --bridge
-  --cs-download [--xbox-ip <ip>] [--out]  Download all save blobs to ./saves
-  --login                                 Xbox Live login (token cache)
-  --list                                  List containers via REST (dev sandboxes only)
+  --cs-download [--xbox-ip <ip>] [--out]  Download via SaveBridge
+  --bridge-import --wgs <path>            Import from Windows PC WGS folder
+  --list                                  List containers (dev sandboxes only)
   --list-steam                            Find Steam save files
   --info --input <f>                      Inspect save file format
   --import --input <f>                    Same as --info
 
 SCID    : ${DEAD_ISLAND_SCID}
+PFN     : ${DEAD_ISLAND_PFN}
 Xbox IP : ${XBOX_IP}:${BRIDGE_PORT}
   `.trim());
 }
