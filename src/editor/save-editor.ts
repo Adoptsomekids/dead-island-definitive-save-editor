@@ -28,6 +28,14 @@ import {
   setStorageItem,
   replaceQuickSlotWeapon,
   setHeldWeapon,
+  parseCollectibles,
+  unlockAllCollectibles,
+  lockAllCollectibles,
+  getMapFogData,
+  clearMapFog,
+  fillMapFog,
+  unlockAllSkills,
+  resetAllSkills,
 } from "../parser/save-file";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -60,6 +68,12 @@ export interface EditOptions {
   maxAllInventory?: boolean;
   /** Max out all storage weapon durability */
   maxStorageDurability?: boolean;
+  /** Unlock all collectibles (ID cards, newspapers, tapes) */
+  unlockAllCollectibles?: boolean;
+  /** Clear all map fog (reveal entire map) */
+  clearMapFog?: boolean;
+  /** Unlock all skill tree nodes */
+  unlockAllSkills?: boolean;
 }
 
 // ─── SaveEditor class ─────────────────────────────────────────────────────────
@@ -282,6 +296,62 @@ export class SaveEditor {
     return this;
   }
 
+  // ── Collectibles + skills + map fog ───────────────────────────────────────
+
+  /** Returns the 42 collectible unlock flags (true = unlocked). */
+  getCollectibles(): boolean[] {
+    this.assertLoaded();
+    return parseCollectibles(this._save!.rawTail);
+  }
+
+  /** Unlock all ID cards, newspapers, and tapes. */
+  unlockAllCollectibles(): this {
+    this.assertLoaded();
+    this._save = unlockAllCollectibles(this._save!);
+    return this;
+  }
+
+  /** Lock all collectibles (for testing). */
+  lockAllCollectibles(): this {
+    this.assertLoaded();
+    this._save = lockAllCollectibles(this._save!);
+    return this;
+  }
+
+  /** Get the map fog data (width, height, raw bytes). */
+  getMapFogData(): { width: number; height: number; data: Buffer } {
+    this.assertLoaded();
+    return getMapFogData(this._save!);
+  }
+
+  /** Clear all map fog — reveal the entire map. */
+  clearMapFog(): this {
+    this.assertLoaded();
+    this._save = clearMapFog(this._save!);
+    return this;
+  }
+
+  /** Fill all map fog — hide the entire map. */
+  fillMapFog(): this {
+    this.assertLoaded();
+    this._save = fillMapFog(this._save!);
+    return this;
+  }
+
+  /** Unlock all skill tree nodes (heuristic scan of skills section). */
+  unlockAllSkills(): this {
+    this.assertLoaded();
+    this._save = unlockAllSkills(this._save!);
+    return this;
+  }
+
+  /** Reset all skill tree nodes to 0 (locked). */
+  resetAllSkills(): this {
+    this.assertLoaded();
+    this._save = resetAllSkills(this._save!);
+    return this;
+  }
+
   // ── Batch edits ────────────────────────────────────────────────────────────
 
   /**
@@ -316,6 +386,18 @@ export class SaveEditor {
     if (opts.maxStorageDurability) {
       this.maxStorageDurability();
       changes.push("all storage durability → 100");
+    }
+    if (opts.unlockAllCollectibles) {
+      this.unlockAllCollectibles();
+      changes.push("all collectibles unlocked");
+    }
+    if (opts.clearMapFog) {
+      this.clearMapFog();
+      changes.push("map fog cleared (full map revealed)");
+    }
+    if (opts.unlockAllSkills) {
+      this.unlockAllSkills();
+      changes.push("all skill tree nodes unlocked");
     }
 
     return changes;

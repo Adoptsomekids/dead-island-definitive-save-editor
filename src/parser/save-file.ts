@@ -654,7 +654,6 @@ export function maxStorageDurability(save: SaveFile): SaveFile {
   }));
   return { ...save, storage };
 }
-
 /** Add or update an item in the storage chest */
 export function setStorageItem(
   save: SaveFile,
@@ -672,5 +671,203 @@ export function setStorageItem(
     return { ...save, storage };
   }
   return { ...save, storage: [...save.storage, newItem] };
+}
+
+// ─── rawTail helpers (collectibles + map fog) ─────────────────────────────────
+//
+// The rawTail in a fully-parsed save_1 has the following layout:
+//
+//  [0x000–0x003]  u32 = 0x200 (512) — skills section allocated byte count
+//  [0x004–0x1FF]  Skills bitmask blob (see skills-encoding notes in docs/)
+//  [0x200–0x364]  Quest / NPC progress data
+//  [0x365–0x368]  u32 = 0x00000003 = 3 (collectible group count, BE-encoded)
+//  [0x369–0x36C]  u32 LE = 3 (same value, LE confirmation byte)
+//  [0x36A–0x393]  Collectibles flags: 42 bytes, each 0x00=locked or 0x01=unlocked
+//                   Group 0 (ID cards):   bytes 0–13
+//                   Group 1 (newspapers): bytes 14–27
+//                   Group 2 (tapes):      bytes 28–41
+//  [0x394–0x397]  u32 LE = fogWidth  (= 12)
+//  [0x398–0x39B]  u32 LE = fogHeight (= 12)
+//  [0x39C–0x48B]  Map fog data: fogWidth * fogHeight bytes (= 144 bytes) or
+//                   (fogWidth * fogHeight + 7) / 8 * something packed bits
+//                   Observed: 240 bytes for 12×12 = packed 5 bytes per row
+//  [0x48C–0x0BFF] Mostly zeros (pre-allocated quest buffer)
+//  [0x0C00–0x100C] Quest completion records: repeating 9-byte entries
+//
+
+/**
+ * Rawail offsets for a "standard" save_1-type save.
+ * These are RELATIVE to the start of rawTail.
+ *
+ * NOTE: These offsets are only valid when _parseError is undefined
+ * (i.e., the save was fully parsed with WEAPON_PREAMBLE_SIZE=57).
+ * For partial-parse saves (save_0, save_2) the rawTail starts earlier
+ * in the file and these offsets do NOT apply.
+ */
+export const RAW_TAIL_OFFSETS = {
+  /** Byte offset of the first collectible flag byte (0=locked, 1=unlocked) */
+  COLLECTIBLES_START: 0x36A,
+  /** Number of collectible flag bytes */
+  COLLECTIBLES_LEN:   42,
+  /** Byte offset of the fog width u32 */
+  FOG_WIDTH_OFF:  0x394,
+  /** Byte offset of the fog height u32 */
+  FOG_HEIGHT_OFF: 0x398,
+  /** Byte offset of the fog data blob */
+  FOG_DATA_START: 0x39C,
+  /** Fog data blob size in bytes (fogWidth × fogHeight × fogBytesPerTile) */
+  FOG_DATA_LEN:   240,
+};
+
+/**
+ * Parse the collectibles flags from a save's rawTail.
+ * Returns an array of booleans (true = unlocked).
+ * Only valid for standard (fully-parsed) saves.
+ */
+export function parseCollectibles(rawTail: Buffer): boolean[] {
+  const { COLLECTIBLES_START: start, COLLECTIBLES_LEN: len } = RAW_TAIL_OFFSETS;
+  if (rawTail.length < start + len) return [];
+  const result: boolean[] = [];
+  for (let i = 0; i < len; i++) {
+    result.push(rawTail[start + i] !== 0);
+  }
+  return result;
+}
+
+/**
+ * Unlock all collectibles by setting every collectible flag byte to 0x01.
+ * Returns a new SaveFile with the modified rawTail.
+ * Only has an effect on standard (fully-parsed, non-_parseError) saves.
+ */
+export function unlockAllCollectibles(save: SaveFile): SaveFile {
+  if (save._parseError) return save; // can't safely edit partial saves
+  const { COLLECTIBLES_START: start, COLLECTIBLES_LEN: len } = RAW_TAIL_OFFSETS;
+  if (save.rawTail.length < start + len) return save;
+
+  const rawTail = Buffer.from(save.rawTail); // copy
+  for (let i = 0; i < len; i++) {
+    rawTail[start + i] = 0x01;
+  }
+  return { ...save, rawTail };
+}
+
+/**
+ * Lock all collectibles by setting every collectible flag byte to 0x00.
+ * Returns a new SaveFile with the modified rawTail.
+ */
+export function lockAllCollectibles(save: SaveFile): SaveFile {
+  if (save._parseError) return save;
+  const { COLLECTIBLES_START: start, COLLECTIBLES_LEN: len } = RAW_TAIL_OFFSETS;
+  if (save.rawTail.length < start + len) return save;
+
+  const rawTail = Buffer.from(save.rawTail);
+  for (let i = 0; i < len; i++) {
+    rawTail[start + i] = 0x00;
+  }
+  return { ...save, rawTail };
+}
+
+/**
+ * Read the map fog data from a save's rawTail.
+ * Returns a Buffer of `fogWidth × fogHeight` bytes (or close to it).
+ * Each byte represents the fog state of one chunk: 0x00 = clear (visited),
+ * non-zero = fogged (not yet explored). The exact encoding may be multi-bit.
+ */
+export function getMapFogData(save: SaveFile): { width: number; height: number; data: Buffer } {
+  const { FOG_WIDTH_OFF, FOG_HEIGHT_OFF, FOG_DATA_START, FOG_DATA_LEN } = RAW_TAIL_OFFSETS;
+  if (save.rawTail.length < FOG_DATA_START + FOG_DATA_LEN) {
+    return { width: 0, height: 0, data: Buffer.alloc(0) };
+  }
+  const width  = save.rawTail.readUInt32LE(FOG_WIDTH_OFF);
+  const height = save.rawTail.readUInt32LE(FOG_HEIGHT_OFF);
+  const data   = save.rawTail.slice(FOG_DATA_START, FOG_DATA_START + FOG_DATA_LEN);
+  return { width, height, data: Buffer.from(data) };
+}
+
+/**
+ * Clear all map fog (reveal the entire map).
+ * Sets all fog data bytes to 0x00.
+ * Returns a new SaveFile with the modified rawTail.
+ */
+export function clearMapFog(save: SaveFile): SaveFile {
+  if (save._parseError) return save;
+  const { FOG_DATA_START: start, FOG_DATA_LEN: len } = RAW_TAIL_OFFSETS;
+  if (save.rawTail.length < start + len) return save;
+
+  const rawTail = Buffer.from(save.rawTail);
+  rawTail.fill(0x00, start, start + len);
+  return { ...save, rawTail };
+}
+
+/**
+ * Restore full map fog (hide the entire map as if never explored).
+ * Sets all fog data bytes to 0xFF.
+ * Returns a new SaveFile with the modified rawTail.
+ */
+export function fillMapFog(save: SaveFile): SaveFile {
+  if (save._parseError) return save;
+  const { FOG_DATA_START: start, FOG_DATA_LEN: len } = RAW_TAIL_OFFSETS;
+  if (save.rawTail.length < start + len) return save;
+
+  const rawTail = Buffer.from(save.rawTail);
+  rawTail.fill(0xFF, start, start + len);
+  return { ...save, rawTail };
+}
+
+/**
+ * Unlock all skills by finding and setting the skill unlock bytes in the skills section.
+ *
+ * The skills section in rawTail[0x000–0x1FF] stores 3 skill trees.
+ * Each tree has a header (12 bytes) followed by entries of [u16 nodeId, u16 unlocked].
+ * A fully maxed character has all non-zero nodeId entries set to unlocked=1.
+ *
+ * Since the exact tree structure varies slightly between saves, this function
+ * uses a heuristic: it scans the skills section for the known entry pattern
+ * and sets unlocked=1 for any entry where nodeId is in the valid skill range.
+ *
+ * SAFE: only modifies rawTail[0x000–0x1FF].
+ */
+export function unlockAllSkills(save: SaveFile): SaveFile {
+  if (save._parseError) return save;
+  const SKILLS_SECTION_END = 0x200;
+  if (save.rawTail.length < SKILLS_SECTION_END) return save;
+
+  const rawTail = Buffer.from(save.rawTail);
+
+  // Scan for [u16 nodeId, u16 pts] entries where nodeId is in range [1, 100]
+  // and mark them as unlocked (pts = 1)
+  // The skill tree data starts around rawTail[0x06C] based on save_1 analysis
+  const SKILLS_DATA_START = 0x04;  // skip the first u32 (section size)
+  for (let i = SKILLS_DATA_START; i < SKILLS_SECTION_END - 4; i += 4) {
+    const nodeId = rawTail.readUInt16LE(i);
+    const pts    = rawTail.readUInt16LE(i + 2);
+    // Valid skill node: nodeId 1–50, currently 0 or 1 points
+    if (nodeId >= 1 && nodeId <= 50 && pts <= 1) {
+      rawTail.writeUInt16LE(1, i + 2); // set to 1 point (unlocked)
+    }
+  }
+  return { ...save, rawTail };
+}
+
+/**
+ * Reset all skills (lock everything, refund no points — use with setLevel for clean respec).
+ * Sets all skill unlock bytes in the skills section to 0.
+ */
+export function resetAllSkills(save: SaveFile): SaveFile {
+  if (save._parseError) return save;
+  const SKILLS_SECTION_END = 0x200;
+  if (save.rawTail.length < SKILLS_SECTION_END) return save;
+
+  const rawTail = Buffer.from(save.rawTail);
+
+  const SKILLS_DATA_START = 0x04;
+  for (let i = SKILLS_DATA_START; i < SKILLS_SECTION_END - 4; i += 4) {
+    const nodeId = rawTail.readUInt16LE(i);
+    const pts    = rawTail.readUInt16LE(i + 2);
+    if (nodeId >= 1 && nodeId <= 50 && pts <= 1) {
+      rawTail.writeUInt16LE(0, i + 2); // set to 0 (locked)
+    }
+  }
+  return { ...save, rawTail };
 }
 

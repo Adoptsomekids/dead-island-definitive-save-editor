@@ -35,6 +35,13 @@ const {
   replaceQuickSlotWeapon,
   maxStorageDurability,
   setStorageItemQty,
+  parseCollectibles,
+  unlockAllCollectibles,
+  lockAllCollectibles,
+  clearMapFog,
+  fillMapFog,
+  unlockAllSkills,
+  resetAllSkills,
   CHARACTER_CLASS,
   CHARACTER_CLASS_BY_KEY,
 } = require("../src/parser/save-file");
@@ -124,6 +131,8 @@ function parseSave(filePath: string): any {
       durability:  it.durability,
       itemLevel:   it.itemLevel,
     })),
+    collectibles:     parseCollectibles(save.rawTail),
+    collectiblesCount: parseCollectibles(save.rawTail).filter((v: boolean) => v).length,
     rawTailSize: save.rawTail?.length ?? 0,
   };
 }
@@ -183,6 +192,30 @@ function applyEdits(
       );
       changes.push(`weapon[${idx}] dur → ${durability}`);
     }
+  }
+  if (edits.unlockCollectibles) {
+    save = unlockAllCollectibles(save);
+    changes.push("all collectibles unlocked (ID cards + newspapers + tapes)");
+  }
+  if (edits.lockCollectibles) {
+    save = lockAllCollectibles(save);
+    changes.push("all collectibles locked");
+  }
+  if (edits.clearMapFog) {
+    save = clearMapFog(save);
+    changes.push("map fog cleared — full map revealed");
+  }
+  if (edits.fillMapFog) {
+    save = fillMapFog(save);
+    changes.push("map fog filled — map hidden");
+  }
+  if (edits.unlockSkills) {
+    save = unlockAllSkills(save);
+    changes.push("all skill tree nodes unlocked");
+  }
+  if (edits.resetSkills) {
+    save = resetAllSkills(save);
+    changes.push("all skill tree nodes reset to 0");
   }
 
   const outBytes  = serializeSaveFile(save);
@@ -848,6 +881,49 @@ function renderEditor(save) {
     </div></div>\`;
   }
 
+  // ── Collectibles + Skills + Fog ──────────────────────────────────────────────
+  if (!save.parseError) {
+    const collUnlocked = (save.collectibles || []).filter((v: boolean) => v).length;
+    const collTotal    = (save.collectibles || []).length;
+    html += \`<div class="panel">
+    <div class="panel-hdr">🏆 Collectibles, Skills &amp; Map</div>
+    <div class="panel-body">
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px;margin-bottom:16px;">
+
+        <div style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:14px;">
+          <div style="font-size:12px;font-weight:700;color:var(--text2);margin-bottom:10px;text-transform:uppercase;letter-spacing:0.08em;">🃏 Collectibles</div>
+          <div style="font-size:28px;font-weight:700;color:\${collUnlocked===collTotal?'#4ade80':'#f0a500'};">\${collUnlocked}<span style="font-size:14px;color:var(--text3)"> / \${collTotal}</span></div>
+          <div style="font-size:11px;color:var(--text3);margin-bottom:12px;">ID cards · Newspapers · Tapes</div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;">
+            <button class="btn btn-primary" style="font-size:11px;padding:5px 10px;" onclick="unlockAllCollectibles()">🔓 Unlock All</button>
+            <button class="btn btn-secondary" style="font-size:11px;padding:5px 10px;" onclick="lockAllCollectibles()">🔒 Lock All</button>
+          </div>
+        </div>
+
+        <div style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:14px;">
+          <div style="font-size:12px;font-weight:700;color:var(--text2);margin-bottom:10px;text-transform:uppercase;letter-spacing:0.08em;">⚡ Skill Trees</div>
+          <div style="font-size:13px;color:var(--text);margin-bottom:8px;line-height:1.5;">Heuristic scan of the skills section unlocks all node entries with valid IDs (1–50).</div>
+          <div style="font-size:11px;color:var(--text3);margin-bottom:12px;">Fury · Power · Survival trees</div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;">
+            <button class="btn btn-primary" style="font-size:11px;padding:5px 10px;" onclick="unlockAllSkills()">⚡ Unlock All Skills</button>
+            <button class="btn btn-secondary" style="font-size:11px;padding:5px 10px;" onclick="resetAllSkills()">🔄 Reset Skills</button>
+          </div>
+        </div>
+
+        <div style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:14px;">
+          <div style="font-size:12px;font-weight:700;color:var(--text2);margin-bottom:10px;text-transform:uppercase;letter-spacing:0.08em;">🗺️ Map Fog</div>
+          <div style="font-size:13px;color:var(--text);margin-bottom:8px;line-height:1.5;">Reveal or hide the map exploration fog of war.</div>
+          <div style="font-size:11px;color:var(--text3);margin-bottom:12px;">12 × 12 tile fog grid (240 bytes)</div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;">
+            <button class="btn btn-primary" style="font-size:11px;padding:5px 10px;" onclick="clearMapFog()">🔭 Reveal Full Map</button>
+            <button class="btn btn-secondary" style="font-size:11px;padding:5px 10px;" onclick="fillMapFog()">🌑 Hide Full Map</button>
+          </div>
+        </div>
+
+      </div>
+    </div></div>\`;
+  }
+
   // ── Download & Xbox Push ────────────────────────────────────────────────────
   html += \`<div class="panel">
     <div class="panel-hdr">📥 Download &amp; Push to Xbox</div>
@@ -919,8 +995,17 @@ async function applyInventoryEdits() {
   await sendEdits({ inventory });
 }
 
-async function maxAllDurability() { await sendEdits({ maxDurability: true }); }
+async function maxAllDurability()     { await sendEdits({ maxDurability: true }); }
 async function maxStorageDurability() { await sendEdits({ maxStorageDurability: true }); }
+// Collectibles
+async function unlockAllCollectibles() { await sendEdits({ unlockCollectibles: true }); }
+async function lockAllCollectibles()   { await sendEdits({ lockCollectibles: true }); }
+// Skills
+async function unlockAllSkills()  { await sendEdits({ unlockSkills: true }); }
+async function resetAllSkills()   { await sendEdits({ resetSkills: true }); }
+// Map fog
+async function clearMapFog()  { await sendEdits({ clearMapFog: true }); }
+async function fillMapFog()   { await sendEdits({ fillMapFog: true }); }
 async function applyStorageEdits() {
   if (!currentSave?.storage) return;
   const storage = currentSave.storage.map((it, i) => ({

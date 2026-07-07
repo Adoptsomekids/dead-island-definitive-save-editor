@@ -801,7 +801,9 @@ async function cmdEdit(): Promise<void> {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const {
     parseSaveFile, serializeSaveFile, maybeDecompress, gzipCompress,
-    setMoney, setLevel, setHP, setInventoryItemQty, maxAllWeaponDurability
+    setMoney, setLevel, setHP, setInventoryItemQty, maxAllWeaponDurability,
+    maxAllInventory, unlockAllCollectibles, clearMapFog, fillMapFog,
+    unlockAllSkills, resetAllSkills,
   } = require("../src/parser/save-file");
 
   const raw = fs.readFileSync(inputFile);
@@ -853,14 +855,43 @@ async function cmdEdit(): Promise<void> {
   }
 
   if (hasFlag("--max-inventory")) {
-    const { maxAllInventory } = require("../src/parser/save-file");
     save = maxAllInventory(save);
     console.log(`✔ Maxed all ${save.inventory.length} inventory item quantities to 999`);
     changed = true;
   }
 
+  if (hasFlag("--unlock-collectibles")) {
+    save = unlockAllCollectibles(save);
+    console.log(`✔ Unlocked all collectibles (ID cards, newspapers, tapes)`);
+    changed = true;
+  }
+
+  if (hasFlag("--clear-fog")) {
+    save = clearMapFog(save);
+    console.log(`✔ Map fog cleared — full map revealed`);
+    changed = true;
+  }
+
+  if (hasFlag("--fill-fog")) {
+    save = fillMapFog(save);
+    console.log(`✔ Map fog filled — full map hidden`);
+    changed = true;
+  }
+
+  if (hasFlag("--unlock-skills")) {
+    save = unlockAllSkills(save);
+    console.log(`✔ All skill tree nodes unlocked`);
+    changed = true;
+  }
+
+  if (hasFlag("--reset-skills")) {
+    save = resetAllSkills(save);
+    console.log(`✔ All skill tree nodes reset`);
+    changed = true;
+  }
+
   if (!changed) {
-    console.log("No edits specified. Use --money N, --level N, --max-hp N, --max-durability, --max-inventory, --item X --item-qty N");
+    console.log("No edits specified. Flags: --money N, --level N, --max-hp N, --max-durability, --max-inventory, --item X --item-qty N, --unlock-collectibles, --clear-fog, --unlock-skills, --reset-skills");
     return;
   }
 
