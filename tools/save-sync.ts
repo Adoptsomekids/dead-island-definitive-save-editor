@@ -1326,12 +1326,280 @@ function cmdListSteam(): void {
   console.log(`To edit:    npx ts-node src/cli.ts --input "${saves[0]}" --god-mode`);
 }
 
+// ── cs-push helpers ────────────────────────────────────────────────────────────
+
+/**
+ * Request a writable SAS URL to upload a new atom to Xbox title storage.
+ * Uses: POST /connectedstorage/users/xuid({xuid})/scids/{scid}/atoms
+ * Body: { size: N }
+ * Returns: { atomGuid: string; blobUri: string }
+ */
+async function getAtomUploadUrl(
+  fullHeader: string,
+  xuid: string,
+  scid: string,
+  size: number,
+  pfn: string
+): Promise<{ atomGuid: string; blobUri: string }> {
+  const url = `${TS_ENDPOINT}/connectedstorage/users/xuid(${xuid})/scids/${scid}/atoms`;
+  const r = await httpsRequest(url, "POST",
+    {
+      "Authorization": fullHeader,
+      "x-xbl-contract-version": "107",
+      "Content-Type": "application/json",
+      "Accept": "application/json",
+      "x-xbl-pfn": pfn,
+    },
+    JSON.stringify({ size })
+  );
+  if (r.status !== 200 && r.status !== 201) {
+    throw new Error(`atoms POST (upload) failed ${r.status}: ${r.body.slice(0, 300)}`);
+  }
+  const body = JSON.parse(r.body);
+  const atomGuid = body.atomGuid ?? body.atom ?? body.id;
+  const blobUri  = body.blobUri ?? body.uploadUri;
+  if (!blobUri)  throw new Error(`No blobUri in upload response: ${r.body.slice(0, 200)}`);
+  if (!atomGuid) throw new Error(`No atomGuid in upload response: ${r.body.slice(0, 200)}`);
+  return { atomGuid, blobUri };
+}
+
+/**
+ * Upload binary bytes to an Azure Blob Storage SAS URL via PUT.
+ */
+function uploadToSasUrl(sasUrl: string, data: Buffer): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const urlObj = new URL(sasUrl);
+    const lib    = urlObj.protocol === "https:" ? require("https") : require("http");
+    const req = lib.request(
+      {
+        hostname: urlObj.hostname,
+        path:     urlObj.pathname + urlObj.search,
+        method:   "PUT",
+        headers: {
+          "Content-Length": data.length,
+          "Content-Type":   "application/octet-stream",
+          "x-ms-blob-type": "BlockBlob",
+        },
+      },
+      (res: any) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (c: Buffer) => chunks.push(c));
+        res.on("end", () => {
+          if (res.statusCode >= 200 && res.statusCode < 300) {
+            resolve();
+          } else {
+            reject(new Error(`SAS PUT failed ${res.statusCode}: ${Buffer.concat(chunks).toString().slice(0, 200)}`));
+          }
+        });
+      }
+    );
+    req.on("error", reject);
+    req.write(data);
+    req.end();
+  });
+}
+
+/**
+ * Commit an updated savedgame manifest to Xbox title storage.
+ * Uses: PUT /connectedstorage/users/xuid({xuid})/scids/{scid}/savedgames/{saveName}
+ * Body: { atoms: [ { name: atomName, atom: atomGuid, size: N } ] }
+ */
+async function commitSavedGame(
+  fullHeader: string,
+  xuid: string,
+  scid: string,
+  saveName: string,
+  atomName: string,
+  atomGuid: string,
+  size: number,
+  pfn: string
+): Promise<void> {
+  const url  = `${TS_ENDPOINT}/connectedstorage/users/xuid(${xuid})/scids/${scid}/savedgames/${encodeURIComponent(saveName)}`;
+  const body = JSON.stringify({ atoms: [{ name: atomName, atom: atomGuid, size }] });
+  const r    = await httpsRequest(url, "PUT",
+    {
+      "Authorization": fullHeader,
+      "x-xbl-contract-version": "107",
+      "Content-Type": "application/json",
+      "Accept": "application/json",
+      "x-xbl-pfn": pfn,
+    },
+    body
+  );
+  if (r.status !== 200 && r.status !== 204) {
+    throw new Error(`savedgames PUT failed ${r.status}: ${r.body.slice(0, 300)}`);
+  }
+}
+
+// ── --cs-push ─────────────────────────────────────────────────────────────────
+/**
+ * Push an edited save file back to Xbox Live Connected Storage.
+ *
+ * Usage:
+ *   npx ts-node tools/save-sync.ts --cs-push \
+ *     --input ./saves/save_1.sav_dec_edited.bin \
+ *     --manifest ./saves/save_1.sav_manifest.json
+ *
+ * The manifest identifies which savedgame slot to overwrite.
+ * If --manifest is not specified, the tool will auto-detect it
+ * by stripping _edited/_dec suffixes from the input filename.
+ *
+ * The input file can be either:
+ *   - decompressed (.sav_dec.bin)  → will be gzip-compressed before upload
+ *   - already gzip-compressed      → uploaded as-is
+ */
+async function cmdCsPush(): Promise<void> {
+  const inputFile    = getArg("--input");
+  const manifestArg  = getArg("--manifest");
+  const scid         = getArg("--scid") ?? DEAD_ISLAND_SCID;
+  const pfn          = getArg("--pfn")  ?? DEAD_ISLAND_PFN;
+  const dryRun       = hasFlag("--dry-run");
+
+  if (!inputFile) {
+    console.error("Usage: --cs-push --input <edited.bin> [--manifest <manifest.json>]");
+    process.exit(1);
+  }
+
+  console.log(`\nDead Island DE — Connected Storage Push`);
+  console.log(`${"─".repeat(45)}`);
+  console.log(`Input  : ${inputFile}`);
+  if (dryRun) console.log(`DRY RUN: will not actually upload`);
+
+  // ── Step 1: Read & prepare the save bytes ────────────────────────────────────
+  const rawBytes = fs.readFileSync(inputFile);
+  const isGzipped = rawBytes[0] === 0x1f && rawBytes[1] === 0x8b;
+
+  let uploadBytes: Buffer;
+  if (isGzipped) {
+    console.log(`Format : already gzip-compressed (${rawBytes.length.toLocaleString()} bytes)`);
+    uploadBytes = rawBytes;
+  } else {
+    // Decompress to verify it's a valid save, then re-compress
+    const { maybeDecompress, gzipCompress } = require("../src/parser/save-file");
+    const dec = maybeDecompress(rawBytes); // no-op since not gzipped
+    // Quick sanity: first 4 bytes must be 0xFFFFFFFF sentinel
+    const sentinel = dec.readUInt32LE(0);
+    if (sentinel !== 0xFFFFFFFF) {
+      throw new Error(`Invalid save file — bad sentinel: 0x${sentinel.toString(16).toUpperCase()}`);
+    }
+    uploadBytes = gzipCompress(rawBytes);
+    console.log(`Format : decompressed → re-compressed (${rawBytes.length} → ${uploadBytes.length} bytes)`);
+  }
+
+  // ── Step 2: Resolve the manifest ────────────────────────────────────────────
+  let manifestPath = manifestArg;
+  if (!manifestPath) {
+    // Auto-detect: strip _edited/_dec/_MAXED/_EDITED suffix variations
+    const baseName = path.basename(inputFile)
+      .replace(/_edited/gi, "")
+      .replace(/_dec/gi, "")
+      .replace(/_MAXED/g, "")
+      .replace(/\.bin$/, "")
+      .trim();
+    const dir = path.dirname(inputFile);
+    // Try several candidate manifest names
+    const candidates = [
+      path.join(dir, baseName + "_manifest.json"),
+      path.join(dir, baseName + ".sav_manifest.json"),
+      // if inputFile is in saves/ look there
+      path.join(SAVES_DIR, baseName + "_manifest.json"),
+      path.join(SAVES_DIR, baseName + ".sav_manifest.json"),
+    ];
+    for (const c of candidates) {
+      if (fs.existsSync(c)) { manifestPath = c; break; }
+    }
+    if (!manifestPath) {
+      console.error(`\n✗ Could not auto-detect manifest file.`);
+      console.error(`  Tried:\n${candidates.map(c => "    " + c).join("\n")}`);
+      console.error(`  Pass --manifest <path> explicitly.`);
+      process.exit(1);
+    }
+  }
+
+  const manifest   = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+  const atoms: Array<{name: string; atom: string; size: number}> = manifest.atoms ?? [];
+  if (atoms.length === 0) throw new Error(`Manifest has no atoms: ${manifestPath}`);
+
+  // Derive the savedgame name from the manifest path
+  const manifestBase = path.basename(manifestPath);
+  const saveName     = manifestBase.replace(/_manifest\.json$/i, "");
+  const atomName     = atoms[0].name; // e.g. "save_1.sav"
+
+  console.log(`Manifest: ${manifestPath}`);
+  console.log(`SaveName: ${saveName}`);
+  console.log(`AtomName: ${atomName}`);
+  console.log(`Old GUID: ${atoms[0].atom}  (${atoms[0].size} bytes)`);
+  console.log(`New size: ${uploadBytes.length} bytes`);
+
+  if (dryRun) {
+    console.log(`\n✔ Dry run complete — would upload ${uploadBytes.length} bytes as atom "${atomName}" to save "${saveName}"`);
+    return;
+  }
+
+  // ── Step 3: Authenticate ────────────────────────────────────────────────────
+  console.log(`\nAuthenticating...`);
+  let fullHeader: string;
+  let xuid: string;
+  let gamertag: string;
+
+  try {
+    const fullAuth = await getFullAuthHeader();
+    fullHeader = fullAuth.header;
+    xuid       = fullAuth.xuid;
+    gamertag   = fullAuth.gamertag;
+  } catch (e: any) {
+    console.error(`\n✗ Full authentication required for upload.`);
+    console.error(`  Run: npx ts-node tools/save-sync.ts --login-legacy`);
+    console.error(`  Then retry --cs-push`);
+    throw e;
+  }
+
+  console.log(`✔ Authenticated as: ${gamertag} (XUID: ${xuid})`);
+
+  // ── Step 4: Get upload SAS URL for new atom ──────────────────────────────────
+  console.log(`\nRequesting upload slot for new atom...`);
+  const { atomGuid: newAtomGuid, blobUri } = await getAtomUploadUrl(
+    fullHeader, xuid, scid, uploadBytes.length, pfn
+  );
+  console.log(`✔ New atom GUID: ${newAtomGuid}`);
+  console.log(`  Upload URL:    ${blobUri.slice(0, 60)}...`);
+
+  // ── Step 5: Upload bytes to Azure Blob SAS URL ───────────────────────────────
+  process.stdout.write(`\nUploading ${uploadBytes.length.toLocaleString()} bytes to Azure Blob... `);
+  await uploadToSasUrl(blobUri, uploadBytes);
+  console.log(`✔`);
+
+  // ── Step 6: Commit the savedgame manifest ────────────────────────────────────
+  process.stdout.write(`Committing savedgame "${saveName}" → atom "${newAtomGuid}"... `);
+  await commitSavedGame(fullHeader, xuid, scid, saveName, atomName, newAtomGuid, uploadBytes.length, pfn);
+  console.log(`✔`);
+
+  // ── Step 7: Update local manifest ────────────────────────────────────────────
+  const updatedManifest = { atoms: [{ name: atomName, atom: newAtomGuid, size: uploadBytes.length }] };
+  fs.writeFileSync(manifestPath, JSON.stringify(updatedManifest, null, 2));
+  console.log(`\nUpdated manifest: ${manifestPath}`);
+
+  console.log(`
+╔══════════════════════════════════════════════════════════════╗
+║  ✔  Save pushed to Xbox Live!                                ║
+╚══════════════════════════════════════════════════════════════╝
+
+  Old atom GUID : ${atoms[0].atom}
+  New atom GUID : ${newAtomGuid}
+  Size          : ${uploadBytes.length.toLocaleString()} bytes
+
+  ★  Launch Dead Island on your Xbox and load the save.
+     The game reads from cloud storage automatically.
+`);
+}
+
 // ── Main ───────────────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
   if (hasFlag("--login"))         { await cmdLogin();        return; }
   if (hasFlag("--login-legacy"))  { await cmdLoginLegacy();  return; }
   if (hasFlag("--cs-pull"))       { await cmdCsPull();       return; }
+  if (hasFlag("--cs-push"))       { await cmdCsPush();       return; }
   if (hasFlag("--list"))          { await cmdList();         return; }
   if (hasFlag("--list-steam"))    { cmdListSteam();          return; }
   if (hasFlag("--bridge"))        { await cmdBridge();       return; }
@@ -1353,18 +1621,31 @@ Dead Island DE — Save Sync + Editor Tool
 
 ★ STEP 1 — Download your save from Xbox Live:
     npx ts-node tools/save-sync.ts --login
-    npx ts-node tools/save-sync.ts --cs-pull --out ./saves
+    npx ts-node tools/save-sync.ts --login-legacy
+    npx ts-node tools/save-sync.ts --cs-pull --out ./saves --full
 
 ★ STEP 2 — Inspect the save:
     npx ts-node tools/save-sync.ts --inspect --input ./saves/save_1.sav_dec.bin
 
 ★ STEP 3 — Edit the save:
-    npx ts-node tools/save-sync.ts --edit --input ./saves/save_1.sav.bin \\
+    npx ts-node tools/save-sync.ts --edit --input ./saves/save_1.sav_dec.bin \\
       --money 9999999 --level 60 --max-durability --output ./saves/save_1_edited.bin
+
+★ STEP 4 — Push edited save back to Xbox Live:
+    npx ts-node tools/save-sync.ts --cs-push \\
+      --input ./saves/save_1.sav_dec_edited.bin \\
+      --manifest ./saves/save_1.sav_manifest.json
+
+    (Or omit --manifest and it will auto-detect from the filename)
 
 DOWNLOAD COMMANDS:
   --login                                 Xbox Live sign-in (one-time, cached)
-  --cs-pull [--out ./saves]               ★ Pull saves directly from Xbox Live
+  --login-legacy                          Legacy Xbox Live login (needed for --full)
+  --cs-pull [--out ./saves]               Pull save manifests from Xbox Live
+  --cs-pull --out ./saves --full          ★ Pull + download binary save atoms
+  --cs-push --input <edited.bin>          ★ Push edited save back to Xbox Live
+    [--manifest <manifest.json>]            Manifest from --cs-pull (auto-detected if omitted)
+    [--dry-run]                             Simulate upload without actually pushing
   --bridge  [--xbox-ip <ip>]              SaveBridge status + container list
   --cs-download [--xbox-ip <ip>] [--out]  Download via SaveBridge
   --bridge-import --wgs <path>            Import from Windows PC WGS folder
