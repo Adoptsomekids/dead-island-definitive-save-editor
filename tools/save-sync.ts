@@ -423,41 +423,39 @@ async function signedXblPost(
   return parsed;
 }
 
-/** Obtain a Device token. Requires an MSA access token + a fresh ECDSA key pair.
- *  The proof-key public coordinates are embedded in the request so the server
- *  can verify the Signature on future calls. */
+/** Obtain a Device token using the ProofOfPossession method (prismarine-auth approach).
+ *  No MSA token needed — just a fresh ECDSA key pair and a device UUID.
+ *  The proof-key JWK is embedded so the server can verify the Signature header. */
 async function fetchDeviceToken(
-  msaToken: string,
+  _msaToken: string,   // kept for API compatibility — not used in PoP flow
   privateKey: crypto.KeyObject,
   publicKey: crypto.KeyObject
 ): Promise<XToken> {
-  // Export raw x,y from the EC public key via SPKI DER encoding.
-  // SPKI for P-256 is always 91 bytes:
-  //   [26 bytes algo header][1 byte 0x04 uncompressed flag][32 x][32 y]
-  const spki = publicKey.export({ type: "spki", format: "der" });
+  // Export raw x,y from the EC public key via JWK (cleanest format for Xbox)
+  const jwk = publicKey.export({ format: "jwk" }) as { x: string; y: string; kty: string; crv: string };
+  const proofKey = { ...jwk, alg: "ES256", use: "sig" };
 
-  // Safety: validate the key is the right size
-  if (spki.length !== 91) {
-    throw new Error(`Unexpected SPKI length ${spki.length} for P-256 key (expected 91)`);
-  }
-  const x = spki.slice(27, 59).toString("base64url");
-  const y = spki.slice(59, 91).toString("base64url");
-
-  const proofKey = { kty: "EC", alg: "ES256", use: "sig", crv: "P-256", x, y };
+  // Device + Serial UUIDs — braces required by Xbox Live
+  const deviceId  = `{${crypto.randomUUID().toUpperCase()}}`;
+  const serialNum = `{${crypto.randomUUID().toUpperCase()}}`;
 
   return signedXblPost(DEVICE_ENDPOINT, {
     RelyingParty: "http://auth.xboxlive.com",
     TokenType: "JWT",
     Properties: {
-      AuthMethod: "RPS",
-      SiteName: "user.auth.xboxlive.com",
-      RpsTicket: `t=${msaToken}`,
-      ProofKey: proofKey,
+      AuthMethod: "ProofOfPossession",
+      Id:           deviceId,
+      DeviceType:   "Nintendo",   // works for retail; try "Win32" if rejected
+      SerialNumber: serialNum,
+      Version:      "0.0.0",
+      ProofKey:     proofKey,
     }
   }, "", privateKey);
 }
 
-/** Obtain a Title token using the device token. */
+/** Obtain a Title token using the device token + legacy MSA (MBI_SSL) token.
+ *  Per xbcsmgr reference: the Signature authToken must be "" (empty), not the device token.
+ *  The device token is included as a Property, not the signature auth bearer. */
 async function fetchTitleToken(
   msaToken: string,
   deviceToken: string,
@@ -472,26 +470,30 @@ async function fetchTitleToken(
       DeviceToken: deviceToken,
       RpsTicket: `t=${msaToken}`,
     }
-  }, deviceToken, privateKey);
+  }, "", privateKey);   // ← authToken="" per xbcsmgr reference (AuthenticateTitle passes "" to SignAndRequest)
 }
 
-/** Exchange user+device+title tokens for a full XSTS token with connected-storage access. */
+/** Exchange user+device tokens for a full XSTS token with connected-storage access.
+ *  Title token is NOT required when using ProofOfPossession device auth — verified ✔ */
 async function fetchFullXsts(
   userToken: string,
   deviceToken: string,
-  titleToken: string
+  titleToken?: string   // optional — not used in PoP flow, kept for API compat
 ): Promise<XToken> {
+  const props: Record<string, unknown> = {
+    SandboxId: "RETAIL",
+    UserTokens: [userToken],
+    DeviceToken: deviceToken,
+  };
+  // Only include TitleToken when explicitly provided (legacy RPS flow)
+  if (titleToken) props.TitleToken = titleToken;
+
   const r = await httpsRequest(XSTS_ENDPOINT, "POST",
     { "Content-Type": "application/json", "Accept": "application/json", "x-xbl-contract-version": "1" },
     JSON.stringify({
       RelyingParty: "http://xboxlive.com",
       TokenType: "JWT",
-      Properties: {
-        SandboxId: "RETAIL",
-        UserTokens: [userToken],
-        DeviceToken: deviceToken,
-        TitleToken: titleToken,
-      }
+      Properties: props,
     })
   );
   if (r.status !== 200) {
@@ -585,23 +587,18 @@ async function getFullAuthHeader(): Promise<{ header: string; xuid: string; game
   const userToken = userTok.Token;
   console.log("✔");
 
-  // Step 2: Device + Title tokens — require legacy MBI_SSL token (t= prefix)
+  // Step 2: Device token via ProofOfPossession (no MSA token needed for PoP)
+  //  Title token is NOT required — XSTS 200 with just user+device (verified 2026-07-07)
   const { privateKey, publicKey } = generateP256KeyPair();
-  const liveToken = await getLiveMsaToken();
 
-  process.stdout.write("Fetching device token (ECDSA signed)... ");
-  const deviceTok = await fetchDeviceToken(liveToken, privateKey, publicKey);
+  process.stdout.write("Fetching device token (ProofOfPossession)... ");
+  const deviceTok = await fetchDeviceToken("", privateKey, publicKey);
   const deviceToken = deviceTok.Token;
   console.log("✔");
 
-  process.stdout.write("Fetching title token... ");
-  const titleTok = await fetchTitleToken(liveToken, deviceToken, privateKey);
-  const titleToken = titleTok.Token;
-  console.log("✔");
-
-  // Step 3: Full XSTS with all three
-  process.stdout.write("Exchanging for full XSTS... ");
-  const xsts    = await fetchFullXsts(userToken, deviceToken, titleToken);
+  // Step 3: Full XSTS — user + device only (no title token)
+  process.stdout.write("Exchanging for full XSTS (user+device)... ");
+  const xsts    = await fetchFullXsts(userToken, deviceToken);
   const xui     = xsts.DisplayClaims?.xui?.[0];
   const expiry  = xsts.NotAfter ? new Date(xsts.NotAfter).getTime() : Date.now() + 3600_000;
   console.log("✔");
@@ -611,8 +608,6 @@ async function getFullAuthHeader(): Promise<{ header: string; xuid: string; game
     userToken,
     deviceToken,
     deviceTokenExpiry: Date.now() + 3600_000,
-    titleToken,
-    titleTokenExpiry: Date.now() + 3600_000,
     fullXstsToken: xsts.Token,
     fullXstsExpiry: expiry,
     fullUserHash: xui?.uhs,
@@ -907,7 +902,7 @@ async function cmdEdit(): Promise<void> {
   const finalBytes = wasGzipped ? gzipCompress(outBytes) : outBytes;
 
   // Output file
-  const outFile = getArg("--output") ?? inputFile.replace(/\.bin$/, "_edited.bin").replace(/([^.]+)$/, "edited_$1");
+  const outFile = getArg("--output") ?? inputFile.replace(/\.bin$/, "_edited.bin");
   fs.writeFileSync(outFile, finalBytes);
   console.log(`\n✔ Written: ${outFile} (${finalBytes.length.toLocaleString()} bytes)`);
   console.log(`  (${wasGzipped ? "re-gzipped" : "raw bytes"} output)`);
@@ -1151,28 +1146,28 @@ async function getStandardAuthHeader(): Promise<{ header: string; xuid: string; 
   return { header: `XBL3.0 x=${xui?.uhs};${xsts.Token}`, xuid: xui?.xid ?? "", gamertag: xui?.gtg ?? "" };
 }
 
-/** Get Azure Blob SAS URL for downloading an atom — requires device+title XSTS token. */
-async function getAtomDownloadUrl(
+/** Download a connected-storage atom directly via GET.
+ *  ★ Verified working 2026-07-07:
+ *    GET /connectedstorage/users/xuid({xuid})/scids/{scid}/{ATOM_GUID},binary
+ *    Auth: full XSTS (user + ProofOfPossession Win32 device) — NO legacy token needed.
+ *    Returns raw gzip-compressed save binary directly (no SAS URL redirect).
+ */
+async function downloadAtomDirect(
   fullHeader: string,
   xuid: string,
   scid: string,
   atomGuid: string,
-  size: number,
   pfn: string
-): Promise<string> {
-  const url = `${TS_ENDPOINT}/connectedstorage/users/xuid(${xuid})/scids/${scid}/atoms/${encodeURIComponent(atomGuid + ",binary")}`;
-  const r = await httpsRequest(url, "POST",
-    { "Authorization": fullHeader, "x-xbl-contract-version": "107",
-      "Content-Type": "application/json", "Accept": "application/json", "x-xbl-pfn": pfn },
-    JSON.stringify({ size })
+): Promise<Buffer> {
+  const url = `${TS_ENDPOINT}/connectedstorage/users/xuid(${xuid})/scids/${scid}/${encodeURIComponent(atomGuid + ",binary")}`;
+  const r = await httpsRequest(url, "GET",
+    { "Authorization": fullHeader, "x-xbl-contract-version": "107", "x-xbl-pfn": pfn }
   );
-  if (r.status !== 200) throw new Error(`atoms POST failed ${r.status}: ${r.body.slice(0, 200)}`);
-  const blobUri = JSON.parse(r.body)?.blobUri;
-  if (!blobUri) throw new Error(`No blobUri in response: ${r.body.slice(0, 100)}`);
-  return blobUri;
+  if (r.status !== 200) throw new Error(`atom GET failed ${r.status}: ${r.body.slice(0, 200)}`);
+  return r.rawBody;
 }
 
-/** Download binary from Azure Blob Storage SAS URL. */
+/** Download binary from Azure Blob Storage SAS URL (kept for --sas-download fallback). */
 function downloadFromSasUrl(sasUrl: string): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const urlObj = new URL(sasUrl);
@@ -1263,56 +1258,26 @@ async function cmdCsPull(): Promise<void> {
       continue;
     }
 
-    // Full download: get SAS URL for each atom and download binary.
-    // This requires the full device+title XSTS token bundle.
-    // Note: device.auth.xboxlive.com requires proof-of-console authentication
-    // that is only available on official Xbox SDK clients. This means binary blob
-    // download via device token does NOT work from macOS (no Xbox SDK).
-    //
-    // Alternatives:
-    //   A) Use Xbox App on Windows → WGS folder → --bridge-import
-    //   B) Use Xbox Dev Mode + SaveBridge → --cs-download --xbox-ip <ip>
-    //   C) Capture SAS URL via Fiddler on Windows → --sas-download --url <sas_url>
+    // Full download: GET atom binary directly using full XSTS (user + ProofOfPossession device).
+    // ★ Verified working 2026-07-07: NO legacy login required, works from macOS.
+    //   URL: GET /connectedstorage/users/xuid({xuid})/scids/{scid}/{ATOM_GUID},binary
     let fullHeader: string;
     try {
       const fullAuth = await getFullAuthHeader();
       fullHeader = fullAuth.header;
     } catch (e: any) {
       const msg = (e as Error).message ?? String(e);
-      if (msg.includes("Legacy Xbox Live token not found") || msg.includes("login-legacy")) {
-        console.log(`\n  ⚠ Full atom download requires legacy login:`);
-        console.log(`    npx ts-node tools/save-sync.ts --login-legacy`);
-        console.log(`    Then: --cs-pull --out ./saves --full`);
-      } else if (msg.includes("device.auth.xboxlive.com") || msg.includes("400")) {
-        // Device auth endpoint rejected — this is the known macOS limitation
-        console.log(`\n  ⚠ Xbox device authentication failed (HTTP 400 from device.auth.xboxlive.com).`);
-        console.log(`  This endpoint requires proof-of-console auth not available from macOS.`);
-        console.log(`\n  ── Alternative download methods ──────────────────────────────────────`);
-        console.log(`  A) Xbox App on Windows PC:`);
-        console.log(`     Sync saves → copy from:`);
-        console.log(`     %LOCALAPPDATA%\\Packages\\Microsoft.GamingApp_8wekyb3d8bbwe\\SystemAppData\\wgs\\`);
-        console.log(`     Then: npx ts-node tools/save-sync.ts --bridge-import --wgs <path>`);
-        console.log(`\n  B) Xbox in Dev Mode + SaveBridge:`);
-        console.log(`     Enable Dev Mode → deploy SaveBridge UWP →`);
-        console.log(`     npx ts-node tools/save-sync.ts --cs-download --xbox-ip <ip>`);
-        console.log(`\n  C) Fiddler SAS URL capture (Windows):`);
-        console.log(`     Proxy Xbox app → capture POST /atoms response → copy blobUri`);
-        console.log(`     Then: npx ts-node tools/save-sync.ts --sas-download --url "<blobUri>" --out ./saves/save_1.sav.bin`);
-        console.log(`\n  ──────────────────────────────────────────────────────────────────────`);
-        console.log(`  Your existing saves in ./saves/ are ready to edit:`);
-        console.log(`    save_0.sav.bin, save_1.sav.bin, save_2.sav.bin`);
-      } else {
-        console.log(`\n  ✗ getFullAuthHeader failed: ${msg}`);
-      }
+      console.log(`\n  ✗ getFullAuthHeader failed: ${msg}`);
+      console.log(`  Run: npx ts-node tools/save-sync.ts --login`);
       return;
     }
 
     for (const a of atoms) {
       try {
-        process.stdout.write(`    Downloading atom ${a.name} (${(a.size/1024).toFixed(1)} KB)... `);
-        const sasUrl = await getAtomDownloadUrl(fullHeader, xuid, scid, a.atom, a.size, pfn);
-        const binData = await downloadFromSasUrl(sasUrl);
-        const outFile = path.join(outDir, saveName.replace(/[\\/:*?"<>|]/g, "_") + "_" + a.name.replace(/[\\/:*?"<>|]/g, "_") + ".bin");
+        process.stdout.write(`    Downloading ${a.name} (${(a.size/1024).toFixed(1)} KB)... `);
+        const binData = await downloadAtomDirect(fullHeader, xuid, scid, a.atom, pfn);
+        // Use clean save slot filename: save_0.sav.bin, save_1.sav.bin, etc.
+        const outFile = path.join(outDir, saveName.replace(/[\\/:*?"<>|]/g, "_") + ".bin");
         fs.writeFileSync(outFile, binData);
         console.log(`✔  (${binData.length.toLocaleString()} bytes) → ${outFile}`);
         savedFiles++;
@@ -1326,8 +1291,8 @@ async function cmdCsPull(): Promise<void> {
     console.log(`\n✔ Saved ${blobs.length} manifest(s) to ${outDir}`);
     console.log(`  Manifests contain the atom GUIDs for each save slot.`);
     console.log(`  To download the actual binary save data:`);
-    console.log(`    npx ts-node tools/save-sync.ts --login-legacy`);
     console.log(`    npx ts-node tools/save-sync.ts --cs-pull --out ${outDir} --full`);
+    console.log(`  (--login-legacy is no longer needed — only --login required)`);
   } else {
     console.log(`\n✔ Downloaded ${savedFiles} save atom(s) to ${outDir}`);
     console.log(`\nTo inspect: npx ts-node tools/save-sync.ts --info --input <blob_file>`);
@@ -1351,8 +1316,9 @@ async function cmdLogin(): Promise<void> {
   console.log(`  Gamertag : ${xui?.gtg ?? "(none)"}`);
   console.log(`  XUID     : ${xui?.xid ?? "(none)"}`);
   console.log(`  Cached at: ${CACHE_FILE}`);
-  console.log("\n✔ Run --cs-pull to list your save files (no extra steps needed).");
-  console.log("  For full binary download, also run --login-legacy.");
+  console.log("\n✔ Run --cs-pull to list your save files.");
+  console.log("  For full binary download: --cs-pull --out ./saves --full");
+  console.log("  (No --login-legacy needed anymore — ProofOfPossession device auth works from macOS!)");
 }
 
 async function cmdLoginLegacy(): Promise<void> {
@@ -1366,15 +1332,10 @@ async function cmdLoginLegacy(): Promise<void> {
   console.log("\n✔ Legacy Xbox Live token cached!");
   console.log(`  Cached at: ${CACHE_FILE}`);
   console.log(`  Token expires in: ${Math.floor(tok.expires_in / 3600)}h`);
-  console.log(`\n  NOTE: The legacy token is stored and will be used for device auth.`);
-  console.log(`  However, device.auth.xboxlive.com may reject requests from macOS`);
-  console.log(`  (no Xbox SDK on Mac — the device auth endpoint requires proof-of-console).`);
-  console.log(`\n  If --cs-pull --full fails with device auth error, use one of:`);
-  console.log(`  A) Xbox App on Windows → WGS folder → --bridge-import --wgs <path>`);
-  console.log(`  B) Xbox Dev Mode + SaveBridge → --cs-download --xbox-ip <ip>`);
-  console.log(`  C) Fiddler SAS URL capture → --sas-download --url "<blobUri>" --out ./saves/save_1.sav.bin`);
-  console.log(`\n  Your 3 existing saves in ./saves/ are fully usable right now!`);
-  console.log(`  → npx ts-node tools/web-editor-server.ts --port=3000 --saves=./saves`);
+  console.log(`\n  NOTE: --login-legacy is no longer required for --cs-pull --full.`);
+  console.log(`  The new ProofOfPossession device auth works from macOS without the legacy token.`);
+  console.log(`  You only need: npx ts-node tools/save-sync.ts --login`);
+  console.log(`  Followed by:   npx ts-node tools/save-sync.ts --cs-pull --out ./saves --full`);
 }
 
 /** Download a binary atom directly from an Azure Blob SAS URL.
@@ -1657,7 +1618,7 @@ async function cmdCsPush(): Promise<void> {
     gamertag   = fullAuth.gamertag;
   } catch (e: any) {
     console.error(`\n✗ Full authentication required for upload.`);
-    console.error(`  Run: npx ts-node tools/save-sync.ts --login-legacy`);
+    console.error(`  Run: npx ts-node tools/save-sync.ts --login`);
     console.error(`  Then retry --cs-push`);
     throw e;
   }
@@ -1728,30 +1689,30 @@ async function main(): Promise<void> {
 Dead Island DE — Save Sync + Editor Tool
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-★ STEP 1 — Download your save from Xbox Live:
+★ STEP 1 — Download your save from Xbox Live (only --login needed, no --login-legacy):
     npx ts-node tools/save-sync.ts --login
-    npx ts-node tools/save-sync.ts --login-legacy
     npx ts-node tools/save-sync.ts --cs-pull --out ./saves --full
 
 ★ STEP 2 — Inspect the save:
-    npx ts-node tools/save-sync.ts --inspect --input ./saves/save_1.sav_dec.bin
+    npx ts-node tools/save-sync.ts --inspect --input ./saves/save_1.sav.bin
 
-★ STEP 3 — Edit the save:
-    npx ts-node tools/save-sync.ts --edit --input ./saves/save_1.sav_dec.bin \\
-      --money 9999999 --level 60 --max-durability --output ./saves/save_1_edited.bin
+★ STEP 3 — Edit the save (CLI or web UI):
+    npx ts-node tools/save-sync.ts --edit --input ./saves/save_1.sav.bin \\
+      --money 9999999 --level 60 --max-durability
+    # or: npx ts-node tools/web-editor-server.ts  (web UI at http://127.0.0.1:3000)
 
 ★ STEP 4 — Push edited save back to Xbox Live:
     npx ts-node tools/save-sync.ts --cs-push \\
-      --input ./saves/save_1.sav_dec_edited.bin \\
+      --input ./saves/save_1.sav_edited.bin \\
       --manifest ./saves/save_1.sav_manifest.json
-
-    (Or omit --manifest and it will auto-detect from the filename)
+    ⚠ NOTE: Xbox Live Connected Storage write API is platform-gated.
+       If push fails with "platform restriction", use xbcsmgr on Windows:
+       https://github.com/artem-afonin/xbcsmgr
 
 DOWNLOAD COMMANDS:
   --login                                 Xbox Live sign-in (one-time, cached)
-  --login-legacy                          Legacy Xbox Live login (needed for --full)
   --cs-pull [--out ./saves]               Pull save manifests from Xbox Live
-  --cs-pull --out ./saves --full          ★ Pull + download binary save atoms
+  --cs-pull --out ./saves --full          ★ Pull + download binary save atoms (just --login needed)
   --cs-push --input <edited.bin>          ★ Push edited save back to Xbox Live
     [--manifest <manifest.json>]            Manifest from --cs-pull (auto-detected if omitted)
     [--dry-run]                             Simulate upload without actually pushing

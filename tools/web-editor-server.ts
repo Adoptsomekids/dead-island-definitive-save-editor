@@ -669,32 +669,42 @@ const CHAR_AVATARS = { 'Sam B':'🥁', 'Xian Mei':'⚔️', 'Logan Carter':'🎯
 
 // ─────────────────────────────────────────────────────────────────────────────
 async function loadFileList() {
-  const res   = await fetch('/api/saves');
-  const files = await res.json();
-  const el    = document.getElementById('file-list');
-  document.getElementById('file-count').textContent = files.length + ' files';
+  try {
+    const res   = await fetch('/api/saves');
+    if (!res.ok) { console.error('loadFileList: HTTP', res.status); return; }
+    const files = await res.json();
+    const el    = document.getElementById('file-list');
+    if (!el) return;
+    const fc = document.getElementById('file-count');
+    if (fc) fc.textContent = files.length + ' file' + (files.length !== 1 ? 's' : '');
 
-  if (files.length === 0) {
-    el.innerHTML = \`<div style="color:var(--text3);font-size:11px;padding:12px 6px;text-align:center;line-height:1.8;">
-      No save files found.<br>Upload a <code>.bin</code> file or<br>run <code>--cs-pull</code></div>\`;
-    return;
-  }
+    if (!Array.isArray(files) || files.length === 0) {
+      el.innerHTML = \`<div style="color:var(--text3);font-size:11px;padding:12px 6px;text-align:center;line-height:1.8;">
+        No save files found.<br>Upload a <code>.bin</code> file or<br>run <code>--cs-pull</code></div>\`;
+      return;
+    }
 
-  el.innerHTML = '';
-  for (const f of files) {
-    const isEdited  = f.name.includes('_edited');
-    const isPartial = false; // will update after parse
-    const card = document.createElement('div');
-    card.className = 'file-card' + (f.name === currentFile ? ' active' : '');
-    card.dataset.name = f.name;
-    card.innerHTML = \`
-      <div class="fc-name">\${f.name}</div>
-      <div class="fc-meta">
-        <span>\${(f.size/1024).toFixed(1)} KB</span>
-        \${isEdited ? '<span class="fc-badge edited">edited</span>' : ''}
-      </div>\`;
-    card.onclick = () => loadSave(f.name, card);
-    el.appendChild(card);
+    el.innerHTML = '';
+    for (const f of files) {
+      if (!f || typeof f.name !== 'string') continue; // skip malformed entries
+      const isEdited = f.name.includes('_edited');
+      const card = document.createElement('div');
+      card.className = 'file-card' + (f.name === currentFile ? ' active' : '');
+      card.dataset.name = f.name;
+      const sizeKB = typeof f.size === 'number' ? (f.size/1024).toFixed(1) + ' KB' : '? KB';
+      card.innerHTML = \`
+        <div class="fc-name">\${f.name}</div>
+        <div class="fc-meta">
+          <span>\${sizeKB}</span>
+          \${isEdited ? '<span class="fc-badge edited">edited</span>' : ''}
+        </div>\`;
+      card.onclick = () => loadSave(f.name, card);
+      el.appendChild(card);
+    }
+  } catch (e) {
+    console.error('loadFileList error:', e);
+    const el = document.getElementById('file-list');
+    if (el) el.innerHTML = \`<div style="color:#ff8888;font-size:11px;padding:12px;">Error loading file list: \${e.message}</div>\`;
   }
 }
 
