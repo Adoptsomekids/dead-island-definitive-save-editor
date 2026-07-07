@@ -716,24 +716,155 @@ async function csDownloadBlob(auth: string, xuid: string, scid: string, blobPath
 
 function inspectSave(filePath: string): void {
   if (!fs.existsSync(filePath)) { console.error(`File not found: ${filePath}`); process.exit(1); }
-  const buf  = fs.readFileSync(filePath);
-  const size = buf.length;
-  console.log(`\nFile: ${filePath} (${size.toLocaleString()} bytes)`);
-  console.log(`\nFirst 64 bytes (hex):`);
-  console.log(buf.slice(0, 64).toString("hex").replace(/(.{32})/g, "$1\n"));
+  const raw = fs.readFileSync(filePath);
 
-  // Check for known magic bytes
-  const magic = buf.readUInt32BE(0);
-  const magicStr = buf.slice(0, 4).toString("ascii").replace(/[^\x20-\x7e]/g, ".");
-  console.log(`\nMagic: 0x${magic.toString(16).toUpperCase().padStart(8, "0")}  "${magicStr}"`);
+  // Import parser
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const {
+    parseSaveFile, maybeDecompress, CHARACTER_CLASS
+  } = require("../src/parser/save-file");
 
-  if (magic === 0x44495345) console.log("✔ DISE format detected (Dead Island save)");
-  else if (buf.slice(0, 3).toString("hex") === "434f4e") console.log("→ Possibly CON/LIVE Xbox 360 STFS container");
-  else if (buf.slice(0, 4).toString("hex") === "58427332") console.log("→ Xbox Series X Connected Storage blob (XBs2)");
-  else console.log("→ Unknown format — may need further analysis");
+  console.log(`\n╔══════════════════════════════════════════════════════════╗`);
+  console.log(`║   Dead Island DE — Save Inspector                        ║`);
+  console.log(`╚══════════════════════════════════════════════════════════╝`);
+  console.log(`\nFile: ${filePath}`);
+  console.log(`Size: ${raw.length.toLocaleString()} bytes (compressed)`);
 
-  console.log(`\nNext steps:`);
-  console.log(`  npx ts-node src/cli.ts --input "${filePath}" --god-mode --max-level`);
+  let decompressed: Buffer;
+  try {
+    decompressed = maybeDecompress(raw);
+    console.log(`Decompressed: ${decompressed.length.toLocaleString()} bytes`);
+  } catch (e: any) {
+    console.log(`Decompression failed: ${e.message} — trying raw`);
+    decompressed = raw;
+  }
+
+  let save: any;
+  try {
+    save = parseSaveFile(decompressed);
+  } catch (e: any) {
+    console.error(`\n✗ Parse failed: ${e.message}`);
+    console.log(`\nFirst 64 bytes (hex):\n${raw.slice(0, 64).toString("hex").replace(/(.{32})/g, "$1\n")}`);
+    return;
+  }
+
+  const h = save.header;
+  const loc = save.location;
+  const charName = CHARACTER_CLASS[loc.charClassId] ?? `Unknown(${loc.charClassId})`;
+
+  console.log(`\n┌─ PLAYER ──────────────────────────────────────────────────`);
+  console.log(`│  Character : ${charName} (${loc.charTypeKey})`);
+  console.log(`│  Level     : ${h.level}`);
+  console.log(`│  HP        : ${h.currHP} / ${h.maxHP}`);
+  console.log(`│  Money     : $${loc.money.toLocaleString()}`);
+  console.log(`│  Save date : ${loc.saveYear}-${String(loc.saveMonth).padStart(2,"0")}-${String(loc.saveDay||1).padStart(2,"0")} ${String(loc.saveHour).padStart(2,"0")}:${String(loc.saveMinute).padStart(2,"0")}`);
+  console.log(`│  Save ver. : ${h.saveVersion}`);
+  console.log(`├─ LOCATION ────────────────────────────────────────────────`);
+  console.log(`│  Map       : ${loc.mapName}`);
+  console.log(`│  Checkpoint: ${loc.checkpoint}`);
+  console.log(`│  Spawn     : ${loc.spawnPoint}`);
+  console.log(`│  Chk2      : ${loc.checkpoint2}`);
+  console.log(`├─ WEAPONS (quick slots: ${save.quickSlots.length}) ────────────────────────────`);
+  for (let i = 0; i < save.quickSlots.length; i++) {
+    const w = save.quickSlots[i];
+    const dur = w.durability.toFixed(1);
+    const craft = w.craftplanId ? ` [${w.craftplanId}]` : "";
+    console.log(`│  [${i}] ${w.itemId}${craft}  dur=${dur}  qty=${w.quantity}  lvl=${w.itemLevel}`);
+  }
+  console.log(`├─ INVENTORY (${save.inventory.length} items) ────────────────────────────────`);
+  const invFiltered = save.inventory.filter((it: any) => it.quantity > 0 && it.itemId);
+  for (const item of invFiltered.slice(0, 30)) {
+    console.log(`│  x${String(item.quantity).padStart(3)}  ${item.itemId}`);
+  }
+  if (invFiltered.length > 30) console.log(`│  ... and ${invFiltered.length - 30} more`);
+  console.log(`└───────────────────────────────────────────────────────────`);
+  console.log(`\nTip: Edit this save with:`);
+  console.log(`  npx ts-node tools/save-sync.ts --edit --input "${filePath}" --money 9999999 --level 60`);
+}
+
+// ── Edit a save file ──────────────────────────────────────────────────────────
+
+async function cmdEdit(): Promise<void> {
+  const inputFile = getArg("--input");
+  if (!inputFile) { console.error("--input <file.bin> required"); process.exit(1); }
+  if (!fs.existsSync(inputFile)) { console.error(`File not found: ${inputFile}`); process.exit(1); }
+
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const {
+    parseSaveFile, serializeSaveFile, maybeDecompress, gzipCompress,
+    setMoney, setLevel, setHP, setInventoryItemQty, maxAllWeaponDurability
+  } = require("../src/parser/save-file");
+
+  const raw = fs.readFileSync(inputFile);
+  const wasGzipped = raw[0] === 0x1f && raw[1] === 0x8b;
+  const decompressed = maybeDecompress(raw);
+  let save = parseSaveFile(decompressed);
+
+  let changed = false;
+
+  const moneyArg = getArg("--money");
+  if (moneyArg !== undefined) {
+    const m = parseInt(moneyArg, 10);
+    if (isNaN(m) || m < 0) { console.error("--money must be a positive integer"); process.exit(1); }
+    save = setMoney(save, m);
+    console.log(`✔ Set money → $${m.toLocaleString()}`);
+    changed = true;
+  }
+
+  const levelArg = getArg("--level");
+  if (levelArg !== undefined) {
+    const l = parseInt(levelArg, 10);
+    if (isNaN(l) || l < 1 || l > 60) { console.error("--level must be 1–60"); process.exit(1); }
+    save = setLevel(save, l);
+    console.log(`✔ Set level → ${l}`);
+    changed = true;
+  }
+
+  const maxHPArg = getArg("--max-hp");
+  if (maxHPArg !== undefined) {
+    const hp = parseInt(maxHPArg, 10);
+    save = setHP(save, hp, hp);
+    console.log(`✔ Set HP → ${hp}`);
+    changed = true;
+  }
+
+  if (hasFlag("--max-durability")) {
+    save = maxAllWeaponDurability(save);
+    console.log(`✔ Maxed durability on all ${save.quickSlots.length} weapons`);
+    changed = true;
+  }
+
+  const itemArg = getArg("--item-qty");
+  const itemIdArg = getArg("--item");
+  if (itemArg !== undefined && itemIdArg !== undefined) {
+    const qty = parseInt(itemArg, 10);
+    save = setInventoryItemQty(save, itemIdArg, qty);
+    console.log(`✔ Set ${itemIdArg} → qty ${qty}`);
+    changed = true;
+  }
+
+  if (hasFlag("--max-inventory")) {
+    const { maxAllInventory } = require("../src/parser/save-file");
+    save = maxAllInventory(save);
+    console.log(`✔ Maxed all ${save.inventory.length} inventory item quantities to 999`);
+    changed = true;
+  }
+
+  if (!changed) {
+    console.log("No edits specified. Use --money N, --level N, --max-hp N, --max-durability, --max-inventory, --item X --item-qty N");
+    return;
+  }
+
+  // Serialize and re-compress
+  const outBytes = serializeSaveFile(save);
+  const finalBytes = wasGzipped ? gzipCompress(outBytes) : outBytes;
+
+  // Output file
+  const outFile = getArg("--output") ?? inputFile.replace(/\.bin$/, "_edited.bin").replace(/([^.]+)$/, "edited_$1");
+  fs.writeFileSync(outFile, finalBytes);
+  console.log(`\n✔ Written: ${outFile} (${finalBytes.length.toLocaleString()} bytes)`);
+  console.log(`  (${wasGzipped ? "re-gzipped" : "raw bytes"} output)`);
+  console.log(`\nTo upload back to Xbox, use the --cs-push command (coming soon).`);
 }
 
 // ── Steam save finder ──────────────────────────────────────────────────────────
@@ -1198,49 +1329,47 @@ async function main(): Promise<void> {
   if (hasFlag("--cs-list"))       { await cmdCsList();       return; }
   if (hasFlag("--cs-download"))   { await cmdCsDownload();   return; }
   if (hasFlag("--bridge-import")) { await cmdBridgeImport(); return; }
+  if (hasFlag("--edit"))          { await cmdEdit();         return; }
 
   const inputFile = getArg("--input");
-  if (hasFlag("--info") || hasFlag("--import")) {
+  if (hasFlag("--inspect") || hasFlag("--info") || hasFlag("--import")) {
     if (!inputFile) { console.error("--input <file> required"); process.exit(1); }
     inspectSave(inputFile);
     return;
   }
 
   console.log(`
-Dead Island DE — Save Sync Tool
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Dead Island DE — Save Sync + Editor Tool
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-HOW TO GET YOUR XBOX SERIES X SAVE FILE:
+★ STEP 1 — Download your save from Xbox Live:
+    npx ts-node tools/save-sync.ts --login
+    npx ts-node tools/save-sync.ts --cs-pull --out ./saves
 
-  ★ Option A — cs-pull (no Xbox needed, direct cloud download):
-      npx ts-node tools/save-sync.ts --login          # one-time sign-in
-      npx ts-node tools/save-sync.ts --cs-pull        # list containers
-      npx ts-node tools/save-sync.ts --cs-pull --out ./saves  # download all
+★ STEP 2 — Inspect the save:
+    npx ts-node tools/save-sync.ts --inspect --input ./saves/save_1.sav_dec.bin
 
-  Option B — SaveBridge (Xbox in Dev Mode):
-    Your Xbox is running SaveBridge on port ${BRIDGE_PORT}.
-    When Xbox Live is online:
-      npx ts-node tools/save-sync.ts --bridge       --xbox-ip ${XBOX_IP}
-      npx ts-node tools/save-sync.ts --cs-download  --xbox-ip ${XBOX_IP} --out ./saves
+★ STEP 3 — Edit the save:
+    npx ts-node tools/save-sync.ts --edit --input ./saves/save_1.sav.bin \\
+      --money 9999999 --level 60 --max-durability --output ./saves/save_1_edited.bin
 
-  Option C — Windows PC + Xbox App:
-    %LOCALAPPDATA%\\Packages\\Microsoft.GamingApp_8wekyb3d8bbwe\\SystemAppData\\wgs\\
-    npx ts-node tools/save-sync.ts --bridge-import --wgs <path>
-
-  Option D — Steam (PC):
-    npx ts-node tools/save-sync.ts --list-steam
-
-COMMANDS:
+DOWNLOAD COMMANDS:
   --login                                 Xbox Live sign-in (one-time, cached)
-  --cs-pull [--out ./saves] [--scid S]    ★ Pull saves directly from Xbox Live
+  --cs-pull [--out ./saves]               ★ Pull saves directly from Xbox Live
   --bridge  [--xbox-ip <ip>]              SaveBridge status + container list
-  --cs-list [--xbox-ip <ip>]              Same as --bridge
   --cs-download [--xbox-ip <ip>] [--out]  Download via SaveBridge
   --bridge-import --wgs <path>            Import from Windows PC WGS folder
-  --list                                  List containers (dev sandboxes only)
   --list-steam                            Find Steam save files
-  --info --input <f>                      Inspect save file format
-  --import --input <f>                    Same as --info
+
+INSPECT / EDIT COMMANDS:
+  --inspect --input <file.bin>            Inspect & display save data
+  --edit    --input <file.bin>            Edit a save file
+    [--output <file.bin>]                   Output file (default: _edited suffix)
+    [--money N]                             Set wallet to N (e.g. 9999999)
+    [--level N]                             Set player level (1–60)
+    [--max-hp N]                            Set max+current HP to N
+    [--max-durability]                      Max out all weapon durability
+    [--item <ItemId> --item-qty N]          Set stackable item quantity
 
 SCID    : ${DEAD_ISLAND_SCID}
 PFN     : ${DEAD_ISLAND_PFN}

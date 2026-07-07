@@ -1,107 +1,230 @@
 # Dead Island Definitive Edition — Save File Format
 
-> Research notes from reverse engineering the Dead Island DE save file binary format.
-> Platform: Xbox Series X / Xbox One (and PC via Steam).
+> Reverse-engineered from real Xbox Series X save blobs (July 2026).
+> All values are **little-endian** unless noted.
 
 ---
 
-## Header (offset 0x0000)
+## Outer Wrapper (GZip / Compressed atom)
 
-| Offset | Size | Type   | Description                        |
-|--------|------|--------|------------------------------------|
-| 0x0000 | 4    | uint32 | Magic: `0x44495345` ("DISE")       |
-| 0x0004 | 4    | uint32 | Save version                       |
-| 0x0008 | 4    | uint32 | Platform flags (0=PC, 1=Xbox, 2=PS)|
-| 0x000C | 4    | uint32 | CRC32 of the data section          |
-| 0x0010 | 4    | uint32 | Total data section size (bytes)    |
-| 0x0014 | 4    | uint32 | Flags (bit 0 = zstd compressed)    |
+The raw atom blob fetched from Xbox Live Connected Storage (`titlestorage.xboxlive.com`)
+is a **gzip-compressed** container. After decompression you get the inner save file below.
+
+```
+[raw atom]  →  gzip decompress  →  [inner save bytes]
+```
 
 ---
 
-## Player Data Block
+## Inner Save File Layout
 
-| Offset | Size | Type    | Description              |
-|--------|------|---------|--------------------------|
-| +0x00  | 4    | uint32  | Block size               |
-| +0x04  | 4    | uint32  | Character class (0-3)    |
-| +0x08  | 4    | float32 | Player health            |
-| +0x0C  | 4    | float32 | Max health               |
-| +0x10  | 4    | uint32  | Experience points        |
-| +0x14  | 4    | uint32  | Level (1-60)             |
-| +0x18  | 4    | uint32  | Skill points available   |
-| +0x1C  | 4    | float32 | Cash/money               |
-| +0x20  | 16   | bytes   | Player GUID              |
-| +0x30  | 64   | string  | Player name (null-term)  |
+### 1. File Header — 0x030 bytes
+
+| Offset | Size | Type   | Value      | Notes                                         |
+|--------|------|--------|------------|-----------------------------------------------|
+| 0x000  | 4    | i32    | 0xFFFFFFFF | Sentinel / magic (-1)                         |
+| 0x004  | 4    | u32    | 0          | Unknown (always 0)                            |
+| 0x008  | 4    | u32    | 5          | Save format version (always 5 in DE)          |
+| 0x00C  | 4    | u32    | 12         | Unknown (always 12)                           |
+| 0x010  | 4    | u32    | 5          | Unknown (always 5)                            |
+| 0x014  | 4    | u32    | level      | **Player level** (1–60)                       |
+| 0x018  | 4    | u32    | maxHP      | Max health points (scaled integer)            |
+| 0x01C  | 4    | u32    | currHP     | Current health points                         |
+| 0x020  | 4    | u32    | 0          | Unknown                                       |
+| 0x024  | 4    | u32    | 2          | Unknown                                       |
+| 0x028  | 4    | u32    | 12         | Unknown                                       |
+| 0x02C  | 4    | u32    | 3          | Unknown                                       |
+
+### 2. Location Block — variable length (starts at 0x030)
+
+All strings in this section use **uint16 LE length prefix** followed by UTF-8 bytes.
+
+| Field        | Type   | Example                        | Notes                            |
+|--------------|--------|--------------------------------|----------------------------------|
+| mapName      | wstr16 | `"ACT1A"`                      | Current map zone                 |
+| checkpoint   | wstr16 | `"HubChapter_2_3_4_9"`         | Active checkpoint name           |
+| spawnPoint   | wstr16 | `"auto_SP_RH_Sinamoi_Hut"`     | Spawn point ID                   |
+| postSpawn    | u32    | 4                              | Unknown flag                     |
+| charTypeKey  | wstr16 | `"Type;SamB"`                  | Character identifier string      |
+| unk_byte0    | u8     | 0                              | Unknown                          |
+| charClassId  | u8     | 2                              | 0=Xian, 1=Logan, 2=SamB, 3=Purna |
+| unk_u16      | u16    | 0                              | Unknown (always 0)               |
+| quickSlotCnt | u32    | 7                              | Number of weapon quick slots     |
+| unk_inv      | u32    | 5                              | Unknown (inv-related)            |
+| checkpoint2  | wstr16 | `"ACT1A_Sinamoi_Busy"`         | Internal checkpoint name         |
+| unk_C        | u32    | 12                             | Unknown                          |
+| unk_D        | u32    | 6                              | Unknown                          |
+| **money**    | u32    | 10247820                       | **Player wallet (cash/money)**   |
+| unk_E        | u32    | 0                              | Unknown                          |
+| saveYear     | u16    | 2026                           | Save date — year                 |
+| saveMonth    | u8     | 7                              | Save date — month                |
+| saveDay      | u8     | 4 (unused/0?)                  | Save date — day                  |
+| saveHour     | u8     | 4                              | Save date — hour                 |
+| saveMinute   | u8     | 0                              | Save date — minute               |
+| unk_F        | u16    | 16                             | Unknown                          |
+| unk_G        | u16    | 22                             | Unknown                          |
+| invSectCnt   | u32    | 8                              | Inventory section count          |
+| unk_pad      | u8     | 0                              | Padding byte                     |
+
+### 3. Weapon Quick Slots — starts at sentinel
+
+Immediately follows the location block:
+
+```
+[FF FF FF FF]   ← sentinel (no active quick-slot override)
+[u32]           ← number of quick-slot weapon items (e.g., 7)
+[Item × N]      ← each item is a WeaponItem (see below)
+```
+
+### 4. WeaponItem Structure
+
+Each weapon item starts with a **57-byte fixed header** followed by two wstr16 strings:
+
+| Field       | Size | Type   | Notes                                  |
+|-------------|------|--------|----------------------------------------|
+| posX        | 4    | f32    | World position X (spawn location)     |
+| posY        | 4    | f32    | World position Y                       |
+| posZ        | 4    | f32    | World position Z                       |
+| orientation | 4    | f32    | Orientation float                      |
+| unk0        | 4    | u32    | Unknown                                |
+| unk1        | 4    | f32    | Unknown float (≈0.37)                  |
+| unk2        | 4    | u32    | Unknown (= 9?)                         |
+| unk3        | 4    | u16+u16| Unknown pair                           |
+| unk4        | 4    | u32    | Unknown                                |
+| unk5        | 4    | u32    | Unknown                                |
+| unk6        | 4    | u32    | Unknown                                |
+| unk7        | 4    | u32    | Unknown                                |
+| unk8        | 4    | u32    | Unknown                                |
+| unk9        | 1    | u8     | Padding / flag                         |
+| **itemId**  | var  | wstr16 | Item type ID (e.g., `"Melee_BoGen"`)  |
+| **craftId** | var  | wstr16 | Craftplan ID (e.g., `"Craftplan_Naildcraft"`) |
+| itemUID     | 4    | u32    | Item unique ID (per-item random value) |
+| quantity    | 4    | u32    | Stack size / ammo count                |
+| durability  | 4    | f32    | Durability 0.0–100.0+ (e.g., 60.54)  |
+| itemLevel   | 4    | u32    | Item level / tier (e.g., 3)           |
+
+### 5. Inventory Items (stackables/consumables)
+
+After weapon quick slots, a section count header appears followed by inventory items:
+
+```
+[u32 count]
+[Item × count]
+```
+
+Inventory item structure:
+```
+wstr16 itemId       e.g. "CraftPart_MetalScrap"
+wstr16 containerStr e.g. "None"  (container/holder ID, or "None")
+u32    itemUID      unique item ID
+u32    quantity     stack count (integer)
+f32    unk_f        float field (often 0xBF800000 = -1.0 for stackables)
+u32    unk_pad      padding / flags
+```
+
+### 6. Skills Section
+
+After inventory, a skills block contains skill tree data.
+Each skill entry is: `u32 skillIndex`, `u8 isUnlocked (0 or 1)`.
+
+### 7. Collectibles / Quests Section
+
+Contains:
+- Quest progress flags (bit arrays)
+- ID card / news / tape unlock status
+- Map fog data (bit field per map)
+
+### 8. Profile Data (PROFILE_DATA blob)
+
+The PROFILE_DATA blob is a separate save file with a different structure:
+- Player stats (kills, deaths, XP, play time)
+- DLC unlock flags
+- Multiplayer settings
+- Achievement/trophy state
+- Character cosmetics
 
 ---
 
-## Inventory Block
+## Character Class IDs
 
-### Block Header
-| Offset | Size | Type   | Description       |
-|--------|------|--------|-------------------|
-| +0x00  | 4    | uint32 | Block size        |
-| +0x04  | 4    | uint32 | Item count        |
-| +0x08  | 4    | uint32 | Storage item count|
+| ID | Character   |
+|----|-------------|
+| 0  | Xian Mei    |
+| 1  | Logan Carter |
+| 2  | Sam B       |
+| 3  | Purna       |
 
-### Item Entry (repeated × item count)
-| Offset | Size | Type    | Description                    |
-|--------|------|---------|--------------------------------|
-| +0x00  | 4    | uint32  | Item ID (see data/items/)      |
-| +0x04  | 4    | float32 | Durability (0.0 – 1.0)         |
-| +0x08  | 2    | uint16  | Quantity / ammo                |
-| +0x0A  | 1    | uint8   | Quick-slot assignment (0xFF=none)|
-| +0x0B  | 1    | uint8   | Flags                          |
-| +0x0C  | 4    | uint32  | Mod slot 1 (item ID or 0)      |
-| +0x10  | 4    | uint32  | Mod slot 2 (item ID or 0)      |
-| +0x14  | 4    | uint32  | Mod slot 3 (item ID or 0)      |
-| +0x18  | 4    | uint32  | Mod slot 4 (item ID or 0)      |
-| +0x1C  | 4    | float32 | Weapon level / upgrade tier    |
+## Map Zone IDs
+
+| mapName   | Location            |
+|-----------|---------------------|
+| `ACT1A`   | Resort (Act 1)      |
+| `ACT2A`   | City of Moresby     |
+| `ACT3A`   | Jungle              |
+| `ACT4A`   | Prison              |
+| `Hotel`   | Hotel (Prologue)    |
 
 ---
 
-## Skills Block
+## Known Item IDs (partial)
 
-| Offset | Size | Type   | Description                       |
-|--------|------|--------|-----------------------------------|
-| +0x00  | 4    | uint32 | Block size                        |
-| +0x04  | 4    | uint32 | Fury tree — bitmask (32 skills)   |
-| +0x08  | 4    | uint32 | Power tree — bitmask              |
-| +0x0C  | 4    | uint32 | Survival tree — bitmask           |
-| +0x10  | 4    | uint32 | Points spent — Fury               |
-| +0x14  | 4    | uint32 | Points spent — Power              |
-| +0x18  | 4    | uint32 | Points spent — Survival           |
+### Weapons
+- `Melee_BoGen` — Blunt weapon (generic)
+- `Melee_StickGen` — Stick (generic)
+- `Melee_BatGen` — Baseball bat
+- `Melee_Fists` — Unarmed / fists
+- `Melee_Paddle` — Paddle
+- `Firearm_AutoRifleGen` — Auto rifle
+- `Firearm_ShotgunShortGen` — Short shotgun
+
+### Craftplans
+- `Craftplan_Naildcraft` — Nailbat
+- `Craftplan_Shockrifle` — Shock rifle
+- `Craftplan_Strikershotgun` — Striker shotgun
+
+### Craft Parts (stackable items)
+- `CraftPart_MetalScrap`
+- `CraftPart_Wire`
+- `CraftPart_BatteryLarge`
+- `CraftPart_Battery`
+- `CraftPart_ElectronicScrap`
+- `CraftPart_Nails`
+- `CraftPart_Tape`
+- `CraftPart_Belt`
+- `CraftPart_Glue`
+- `CraftPart_Soap`
+- `CraftPart_GasForLighter`
+- `CraftPart_Lighter`
+- `CraftPart_CircularBlade`
+- `CraftPart_Clamp`
+- `CraftPart_Rag`
+- `CraftPart_BarbedWire`
+- `CraftPart_EngineParts`
+- `CraftPart_Magnet`
+- `CraftPart_Gear`
+- `CraftPart_Watch`
+- `CraftPart_Deodorant`
+- `CraftPart_LargeNail`
+- `CraftPart_Oleander`
+- `CraftPart_DrugsUnit`
+- `CraftPart_Bandages`
+- `CraftPart_Painkillers`
+- `CraftPart_Lp4000Battery`
+
+### Consumables / Throwables / Misc
+- `Powerup_Alcohol`
+- `Food_Can`
+- `CraftPart_Water`
+- `Throwable_Molotov`
+- `Medkit_HealthPackMedium`
+- `Car Part`
 
 ---
 
-## Map / Fog of War Block
+## Notes on Save Re-serialization
 
-| Offset | Size   | Type   | Description                          |
-|--------|--------|--------|--------------------------------------|
-| +0x00  | 4      | uint32 | Block size                           |
-| +0x04  | 4      | uint32 | Map ID                               |
-| +0x08  | N      | bytes  | Fog bitmap (1 bit per tile, row-major)|
-
----
-
-## Collectibles Block
-
-| Offset | Size | Type   | Description                            |
-|--------|------|--------|----------------------------------------|
-| +0x00  | 4    | uint32 | Block size                             |
-| +0x04  | 4    | uint32 | ID cards unlocked bitmask (64 cards)   |
-| +0x08  | 4    | uint32 | News items unlocked bitmask (32 items) |
-| +0x0C  | 4    | uint32 | Tapes unlocked bitmask (32 tapes)      |
-| +0x10  | 4    | uint32 | Blueprints unlocked bitmask (128 BPs)  |
-| +0x14  | 12   | uint32[3] | Blueprints unlocked ext. bitmask    |
-
----
-
-## Notes
-
-- All integers are **little-endian**.
-- Strings are null-terminated UTF-8.
-- The data section (after header) may be **zstd-compressed** when flag bit 0 is set.
-- CRC32 is computed over the raw (post-decompression) data section.
-- These offsets are **preliminary** and require validation against live save dumps.
-- Use `scripts/dump-save.ts` to hex-dump a save and cross-reference field values.
+1. The outer blob is gzip-compressed — you must re-compress after editing.
+2. The checksum (if any) is not yet identified; the game may use a CRC on the inner data.
+3. The `money` field at offset (header + location block + 0x18 from checkpoint2 end) can be
+   directly edited to set the player's wallet amount.
+4. Quick-slot weapons use item-type string IDs from the game's internal item database.

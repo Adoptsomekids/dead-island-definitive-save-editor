@@ -2,8 +2,6 @@
 // Binary stream reader/writer — position-aware, little-endian by default.
 // Inspired by the libvantage Stream class.
 
-import BigInteger from "big-integer";
-
 export enum SeekOrigin {
   Begin = 0,
   Current = 1,
@@ -30,10 +28,18 @@ export class Stream {
     return s;
   }
 
+  static from(buf: Buffer): Stream {
+    return new Stream(buf);
+  }
+
   // ── Properties ───────────────────────────────────────────────────────────
 
   get position(): number {
     return this._position;
+  }
+
+  set position(v: number) {
+    this._position = v;
   }
 
   get length(): number {
@@ -135,36 +141,27 @@ export class Stream {
     return v;
   }
 
-  readUInt64(littleEndian: boolean = true): BigInteger.BigInteger {
-    const lo = littleEndian
-      ? this._buffer.readUInt32LE(this._position)
-      : this._buffer.readUInt32BE(this._position);
-    const hi = littleEndian
-      ? this._buffer.readUInt32LE(this._position + 4)
-      : this._buffer.readUInt32BE(this._position + 4);
-    this._position += 8;
-    return BigInteger(hi).shiftLeft(32).or(BigInteger(lo));
-  }
-
+  /** Read a null-terminated or fixed-length string */
   readString(maxBytes: number, encoding: BufferEncoding = "utf8"): string {
     const bytes = this.readBytes(maxBytes);
     const nullIdx = bytes.indexOf(0);
     return bytes.slice(0, nullIdx >= 0 ? nullIdx : maxBytes).toString(encoding);
   }
 
+  /**
+   * Read a DI-style length-prefixed string:
+   *   [uint16 LE length][UTF-8 bytes × length]
+   */
+  readWStr(): string {
+    const len = this.readUInt16();
+    if (len === 0) return "";
+    return this.readBytes(len).toString("utf8");
+  }
+
   /** Read a length-prefixed string (uint32 length + data) */
   readLPString(encoding: BufferEncoding = "utf8"): string {
     const len = this.readUInt32();
     return this.readBytes(len).toString(encoding);
-  }
-
-  /** Loop helper: reads count uint32 values and maps them */
-  loopUInt32<T>(count: number, fn: (value: number, index: number) => T): T[] {
-    const result: T[] = [];
-    for (let i = 0; i < count; i++) {
-      result.push(fn(this.readUInt32(), i));
-    }
-    return result;
   }
 
   // ── Writes ────────────────────────────────────────────────────────────────
@@ -248,21 +245,6 @@ export class Stream {
     return this;
   }
 
-  writeUInt64(value: BigInteger.BigInteger, littleEndian: boolean = true): this {
-    this.ensureCapacity(8);
-    const lo = value.and(0xffffffff).toJSNumber();
-    const hi = value.shiftRight(32).and(0xffffffff).toJSNumber();
-    if (littleEndian) {
-      this._buffer.writeUInt32LE(lo, this._position);
-      this._buffer.writeUInt32LE(hi, this._position + 4);
-    } else {
-      this._buffer.writeUInt32BE(hi, this._position);
-      this._buffer.writeUInt32BE(lo, this._position + 4);
-    }
-    this._position += 8;
-    return this;
-  }
-
   writeString(
     value: string,
     maxBytes: number,
@@ -277,6 +259,17 @@ export class Stream {
       this._buffer.writeUInt8(0, this._position + toCopy);
     }
     this._position += maxBytes;
+    return this;
+  }
+
+  /**
+   * Write a DI-style length-prefixed string:
+   *   [uint16 LE length][UTF-8 bytes × length]
+   */
+  writeWStr(value: string): this {
+    const encoded = Buffer.from(value, "utf8");
+    this.writeUInt16(encoded.length);
+    this.writeBytes(encoded);
     return this;
   }
 
