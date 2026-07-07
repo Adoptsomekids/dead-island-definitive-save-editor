@@ -42,6 +42,12 @@ const {
   fillMapFog,
   unlockAllSkills,
   resetAllSkills,
+  addInventoryItem,
+  removeInventoryItem,
+  addQuickSlotWeapon,
+  setCharacterClass,
+  setCheckpoint,
+  applyGodMode,
   CHARACTER_CLASS,
   CHARACTER_CLASS_BY_KEY,
 } = require("../src/parser/save-file");
@@ -216,6 +222,49 @@ function applyEdits(
   if (edits.resetSkills) {
     save = resetAllSkills(save);
     changes.push("all skill tree nodes reset to 0");
+  }
+
+  // ── New helpers ──────────────────────────────────────────────────────────────
+  if (edits.godMode) {
+    save = applyGodMode(save);
+    changes.push("GOD MODE applied (lvl60, $9.9M, maxHP, maxDur, allCollectibles, allSkills, fogCleared)");
+  }
+  if (edits.addItem && edits.addItem.itemId) {
+    const qty = parseInt(edits.addItem.quantity ?? "1", 10);
+    save = addInventoryItem(save, edits.addItem.itemId, qty);
+    changes.push(`added ${qty}× ${edits.addItem.itemId}`);
+  }
+  if (edits.removeItem) {
+    save = removeInventoryItem(save, edits.removeItem);
+    changes.push(`removed ${edits.removeItem} from inventory`);
+  }
+  if (edits.addWeapon && edits.addWeapon.itemId) {
+    const w = edits.addWeapon;
+    save = addQuickSlotWeapon(
+      save,
+      w.itemId,
+      w.craftplanId ?? "",
+      parseInt(w.level ?? "3", 10),
+      parseFloat(w.durability ?? "100"),
+      parseInt(w.quantity ?? "1", 10)
+    );
+    changes.push(`added weapon ${w.itemId} (lvl ${w.level ?? 3})`);
+  }
+  if (edits.charClass !== undefined) {
+    const classId = parseInt(edits.charClass, 10) as 0|1|2|3;
+    save = setCharacterClass(save, classId);
+    const names: Record<number,string> = { 0:"Xian Mei", 1:"Logan Carter", 2:"Sam B", 3:"Purna" };
+    changes.push(`character → ${names[classId] ?? classId}`);
+  }
+  if (edits.teleport) {
+    save = setCheckpoint(
+      save,
+      edits.teleport.mapName  || undefined,
+      edits.teleport.checkpoint || undefined,
+      edits.teleport.spawnPoint || undefined,
+      edits.teleport.checkpoint2 || undefined
+    );
+    changes.push(`teleported → ${edits.teleport.mapName ?? save.location.mapName}`);
   }
 
   const outBytes  = serializeSaveFile(save);
@@ -416,6 +465,31 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // ── POST /api/cs-pull ─────────────────────────────────────────────────────
+  // Trigger an Xbox Live download (cs-pull) from the browser
+  if (pathname === "/api/cs-pull" && req.method === "POST") {
+    const tsNode   = path.join(__dirname, "../node_modules/.bin/ts-node");
+    const syncTool = path.join(__dirname, "./save-sync.ts");
+    const { spawn } = require("child_process");
+    const child = spawn(tsNode, [
+      "--transpile-only", syncTool,
+      "--cs-pull", "--out", SAVES, "--full",
+    ], { cwd: path.join(__dirname, "..") });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (d: Buffer) => { stdout += d.toString(); });
+    child.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
+    child.on("close", (code: number) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ success: code === 0, output: stdout || stderr }));
+    });
+    child.on("error", (e: any) => {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: e.message }));
+    });
+    return;
+  }
+
   // ── GET /api/manifests ─────────────────────────────────────────────────────
   if (pathname === "/api/manifests" && req.method === "GET") {
     if (!fs.existsSync(SAVES)) { res.writeHead(200, { "Content-Type": "application/json" }); res.end("[]"); return; }
@@ -574,6 +648,21 @@ body { font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; background
 /* ── Warning ── */
 .warn-box { background: rgba(243,156,18,0.1); border: 1px solid #7f5000; border-radius: 6px; padding: 10px 14px; font-size: 11px; color: #f39c12; margin-bottom: 14px; display: flex; gap: 8px; }
 
+/* ── Add-item panel ── */
+.item-add-row { display: grid; grid-template-columns: 1fr 70px 80px; gap: 8px; align-items: end; margin-bottom: 8px; }
+.item-add-row.weapon { grid-template-columns: 1fr 1fr 60px 60px 60px 70px; }
+.tags { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px; }
+.tag { display: inline-block; background: #1a1420; border: 1px solid #3a2a40; border-radius: 4px; padding: 2px 8px; font-size: 10px; color: #cc99ff; cursor: pointer; transition: all 0.1s; }
+.tag:hover { background: #2a1f38; border-color: var(--accent); color: #ffaaff; }
+.tag.weapon-tag { background: #0a1a14; border-color: #1a3a2a; color: #88ffaa; }
+.tag.weapon-tag:hover { background: #0f2a1f; border-color: #27ae60; }
+
+/* ── Teleport panel ── */
+.teleport-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; margin-bottom: 12px; }
+.tp-btn { background: #0a0a18; border: 1px solid #252548; border-radius: 7px; padding: 10px 12px; cursor: pointer; transition: all 0.15s; text-align: center; color: var(--text2); font-size: 12px; font-weight: 700; }
+.tp-btn:hover { border-color: #5555aa; background: #12122a; color: #aaaaff; box-shadow: 0 0 8px rgba(100,100,255,0.2); }
+.tp-btn span { display: block; font-size: 20px; margin-bottom: 4px; }
+
 /* ── Misc ── */
 .loading { text-align: center; padding: 60px 0; color: var(--text3); font-size: 16px; }
 .empty   { text-align: center; padding: 80px 0; color: var(--text3); font-size: 14px; }
@@ -597,6 +686,7 @@ code { background: #1a1a24; padding: 2px 6px; border-radius: 4px; font-size: 11p
     <div class="hdr-sub">Xbox Series X · Definitive Edition · v2.0</div>
   </div>
   <div class="hdr-actions">
+    <button class="btn btn-secondary btn-sm" onclick="pullFromXbox()" title="Download saves from Xbox Live (requires --login)" id="btn-pull">☁️ Pull Xbox</button>
     <label class="btn btn-secondary btn-sm" style="cursor:pointer;" title="Upload a .bin save file">
       📂 Upload Save
       <input type="file" id="upload-input" accept=".bin" style="display:none" onchange="uploadSave(this)">
@@ -934,6 +1024,84 @@ function renderEditor(save) {
     </div></div>\`;
   }
 
+  // ── Add Item / Add Weapon ────────────────────────────────────────────────────
+  if (!save.parseError) {
+    html += \`<div class="panel">
+    <div class="panel-hdr">➕ Add Item / Weapon</div>
+    <div class="panel-body">
+
+      <div style="margin-bottom:16px;">
+        <div style="font-size:11px;font-weight:700;color:var(--text3);text-transform:uppercase;letter-spacing:0.08em;margin-bottom:10px;">🎒 Add Consumable / Craft Part</div>
+        <div class="item-add-row">
+          <div class="field"><label>Item ID</label><input type="text" id="add-item-id" placeholder="CraftPart_MetalScrap" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:7px 10px;color:var(--text);font-size:12px;width:100%;"></div>
+          <div class="field"><label>Qty</label><input type="number" id="add-item-qty" value="99" min="1" max="999" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:7px 10px;color:var(--text);font-size:12px;width:100%;text-align:center;"></div>
+          <div class="field"><label>&nbsp;</label><button class="btn btn-primary" style="width:100%;" onclick="doAddItem()">➕ Add</button></div>
+        </div>
+        <div class="tags">
+          <div style="font-size:9px;color:var(--text3);width:100%;margin-bottom:3px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;">Quick pick (click to fill):</div>
+          \${['CraftPart_MetalScrap','CraftPart_Wire','CraftPart_Blade','CraftPart_Duct_Tape','CraftPart_Nail','CraftPart_Resin','CraftPart_Battery','CraftPart_Alcohol','Medkit_Small','Medkit_Big','Powerup_Stamina','Food_Juice','Throwable_MolotovCocktail','Throwable_Grenade'].map(id =>
+            \`<span class="tag" onclick="document.getElementById('add-item-id').value='\${id}'">\${id.replace(/^(CraftPart_|Powerup_|Throwable_|Food_|Medkit_)/,'')}</span>\`
+          ).join('')}
+        </div>
+      </div>
+
+      <div style="border-top:1px solid var(--border);padding-top:14px;">
+        <div style="font-size:11px;font-weight:700;color:var(--text3);text-transform:uppercase;letter-spacing:0.08em;margin-bottom:10px;">⚔️ Add Weapon (quick slot)</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr 60px 60px 60px;gap:8px;align-items:end;margin-bottom:8px;">
+          <div class="field"><label>Item ID</label><input type="text" id="add-wep-id" placeholder="Melee_BoGen" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:7px 10px;color:var(--text);font-size:12px;width:100%;"></div>
+          <div class="field"><label>Craftplan</label><input type="text" id="add-wep-plan" placeholder="Craftplan_Naildcraft" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:7px 10px;color:var(--text);font-size:12px;width:100%;"></div>
+          <div class="field"><label>Lvl</label><input type="number" id="add-wep-lvl" value="5" min="1" max="10" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:7px 10px;color:var(--text);font-size:12px;width:100%;text-align:center;"></div>
+          <div class="field"><label>Qty</label><input type="number" id="add-wep-qty" value="1" min="1" max="9999" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:7px 10px;color:var(--text);font-size:12px;width:100%;text-align:center;"></div>
+          <div class="field"><label>&nbsp;</label><button class="btn btn-success" style="width:100%;" onclick="doAddWeapon()">➕</button></div>
+        </div>
+        <div class="tags">
+          <div style="font-size:9px;color:var(--text3);width:100%;margin-bottom:3px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;">Weapons quick pick:</div>
+          \${['Melee_BoGen','Melee_Machete','Melee_Katana','Melee_Hammer','Firearm_Pistol','Firearm_Shotgun','Firearm_AssaultRifle','Firearm_SniperRifle'].map(id =>
+            \`<span class="tag weapon-tag" onclick="document.getElementById('add-wep-id').value='\${id}'">\${id.replace(/^(Melee_|Firearm_)/,'')}</span>\`
+          ).join('')}
+        </div>
+      </div>
+
+    </div></div>\`;
+  }
+
+  // ── Teleport & Character ────────────────────────────────────────────────────
+  html += \`<div class="panel">
+    <div class="panel-hdr">🗺️ Teleport &amp; Character</div>
+    <div class="panel-body">
+
+      <div style="margin-bottom:16px;">
+        <div style="font-size:11px;font-weight:700;color:var(--text3);text-transform:uppercase;letter-spacing:0.08em;margin-bottom:10px;">📍 Teleport to Map</div>
+        <div class="teleport-grid">
+          \${[
+            {map:'Hotel',      cp:'HotelChapter_1',       sp:'auto_SP_Hotel_HotelLobby',      icon:'🏨', label:'Hotel (Prologue)'},
+            {map:'ACT1A',      cp:'HubChapter_2_3_4_9',   sp:'auto_SP_RH_Sinamoi_Hut',        icon:'🌴', label:'Resort – Act 1'},
+            {map:'ACT2A',      cp:'ACT2A_Start',          sp:'auto_SP_ACT2A_CityStart',       icon:'🏙️', label:'Moresby – Act 2'},
+            {map:'ACT3A',      cp:'ACT3A_Start',          sp:'auto_SP_ACT3A_JungleStart',     icon:'🌿', label:'Jungle – Act 3'},
+            {map:'ACT4A',      cp:'ACT4A_Start',          sp:'auto_SP_ACT4A_PrisonStart',     icon:'🔒', label:'Prison – Act 4'},
+          ].map(t => \`<button class="tp-btn" onclick="doTeleport('\${t.map}','\${t.cp}','\${t.sp}')"><span>\${t.icon}</span>\${t.label}</button>\`).join('')}
+        </div>
+        <div style="font-size:10px;color:var(--text3);line-height:1.6;">⚠️ Changing map will update your spawn point. Checkpoint names above are best-guesses — the game will use the nearest valid checkpoint if the exact one is not found.</div>
+      </div>
+
+      <div style="border-top:1px solid var(--border);padding-top:14px;">
+        <div style="font-size:11px;font-weight:700;color:var(--text3);text-transform:uppercase;letter-spacing:0.08em;margin-bottom:10px;">🧑 Change Character</div>
+        <div style="display:flex;gap:10px;flex-wrap:wrap;">
+          \${[
+            {id:2, name:'Sam B',       avatar:'🥁', color:'#ff6655'},
+            {id:0, name:'Xian Mei',    avatar:'⚔️', color:'#55aaff'},
+            {id:1, name:'Logan Carter',avatar:'🎯', color:'#ffaa55'},
+            {id:3, name:'Purna',       avatar:'🔫', color:'#ff55aa'},
+          ].map(c => \`<button class="tp-btn" style="min-width:110px;" onclick="doChangeChar(\${c.id})">
+            <span>\${c.avatar}</span>
+            <span style="color:\${c.color};">\${c.name}</span>
+          </button>\`).join('')}
+        </div>
+        <div style="font-size:10px;color:var(--text3);margin-top:10px;line-height:1.6;">⚠️ Changing character class changes your character model and skills in-game. Only do this at the start of a new game or if you know what you're doing.</div>
+      </div>
+
+    </div></div>\`;
+
   // ── Download & Xbox Push ────────────────────────────────────────────────────
   html += \`<div class="panel">
     <div class="panel-hdr">📥 Download &amp; Push to Xbox</div>
@@ -1041,11 +1209,60 @@ function setAllInventory(qty) {
 
 async function applyPreset(preset) {
   const presets = {
-    god:      { level: 60, money: 9999999, maxHP: 9999, maxDurability: true },
+    god:      { godMode: true },
     maxmoney: { money: 9999999 },
     maxlevel: { level: 60 },
   };
   if (presets[preset]) await sendEdits(presets[preset]);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// New helper actions
+async function doAddItem() {
+  const itemId  = document.getElementById('add-item-id')?.value?.trim();
+  const qty     = parseInt(document.getElementById('add-item-qty')?.value ?? '1', 10);
+  if (!itemId) { showToast('Enter an item ID first', true); return; }
+  await sendEdits({ addItem: { itemId, quantity: qty } });
+}
+
+async function doAddWeapon() {
+  const itemId     = document.getElementById('add-wep-id')?.value?.trim();
+  const craftplanId = document.getElementById('add-wep-plan')?.value?.trim() || '';
+  const level      = parseInt(document.getElementById('add-wep-lvl')?.value ?? '5', 10);
+  const quantity   = parseInt(document.getElementById('add-wep-qty')?.value ?? '1', 10);
+  if (!itemId) { showToast('Enter a weapon item ID first', true); return; }
+  await sendEdits({ addWeapon: { itemId, craftplanId, level, durability: 100, quantity } });
+}
+
+async function doTeleport(mapName, checkpoint, spawnPoint) {
+  await sendEdits({ teleport: { mapName, checkpoint, spawnPoint, checkpoint2: checkpoint } });
+}
+
+async function doChangeChar(classId) {
+  const names = { 0:'Xian Mei', 1:'Logan Carter', 2:'Sam B', 3:'Purna' };
+  if (!confirm('Change character to ' + names[classId] + '? This will be reflected next time the save loads.')) return;
+  await sendEdits({ charClass: classId });
+}
+
+// Pull from Xbox Live (spawns save-sync --cs-pull in background)
+async function pullFromXbox() {
+  const btn = document.getElementById('btn-pull');
+  if (btn) { btn.textContent = '⏳ Pulling…'; btn.disabled = true; }
+  showToast('☁️ Downloading saves from Xbox Live…', false, true);
+  try {
+    const res    = await fetch('/api/cs-pull', { method: 'POST' });
+    const result = await res.json();
+    if (result.success) {
+      showToast('✔ Saves downloaded from Xbox Live!\n' + (result.output?.split('\\n').slice(-4).join('\\n') ?? ''));
+      await loadFileList();
+    } else {
+      showToast('✗ Pull failed — check terminal for details.\n' + (result.output ?? '').slice(0, 200), true);
+    }
+  } catch (e) {
+    showToast('Pull error: ' + e.message, true);
+  } finally {
+    if (btn) { btn.textContent = '☁️ Pull Xbox'; btn.disabled = false; }
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

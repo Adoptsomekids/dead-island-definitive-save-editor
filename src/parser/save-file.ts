@@ -859,7 +859,6 @@ export function resetAllSkills(save: SaveFile): SaveFile {
   if (save.rawTail.length < SKILLS_SECTION_END) return save;
 
   const rawTail = Buffer.from(save.rawTail);
-
   const SKILLS_DATA_START = 0x04;
   for (let i = SKILLS_DATA_START; i < SKILLS_SECTION_END - 4; i += 4) {
     const nodeId = rawTail.readUInt16LE(i);
@@ -869,5 +868,134 @@ export function resetAllSkills(save: SaveFile): SaveFile {
     }
   }
   return { ...save, rawTail };
+}
+
+// ─── New high-level helpers ───────────────────────────────────────────────────
+
+/**
+ * Add a new item to the inventory (or increment quantity if itemId already exists).
+ */
+export function addInventoryItem(
+  save: SaveFile,
+  itemId: string,
+  quantity = 1,
+  containerId = "None",
+  itemUID?: number
+): SaveFile {
+  if (save._parseError) return save;
+  const existing = save.inventory.findIndex(it => it.itemId === itemId);
+  if (existing >= 0) {
+    const inventory = save.inventory.map((it, i) =>
+      i === existing ? { ...it, quantity: it.quantity + quantity } : it
+    );
+    return { ...save, inventory };
+  }
+  const uid = itemUID ?? (Date.now() & 0x7FFFFFFF);
+  const newItem: InventoryItem = {
+    itemId,
+    containerId,
+    itemUID:  uid,
+    quantity: quantity >>> 0,
+    unk_f:    -1.0,
+    unk_pad:  0,
+  };
+  return { ...save, inventory: [...save.inventory, newItem] };
+}
+
+/**
+ * Remove an inventory item entirely by itemId.
+ */
+export function removeInventoryItem(save: SaveFile, itemId: string): SaveFile {
+  if (save._parseError) return save;
+  return { ...save, inventory: save.inventory.filter(it => it.itemId !== itemId) };
+}
+
+/**
+ * Add a new weapon to the quick-slot array.
+ * The slot count in location.quickSlotCount is updated automatically.
+ */
+export function addQuickSlotWeapon(
+  save: SaveFile,
+  itemId: string,
+  craftplanId = "",
+  level       = 3,
+  durability  = 100.0,
+  quantity    = 1,
+  itemUID?: number
+): SaveFile {
+  if (save._parseError) return save;
+  const uid      = itemUID ?? (Date.now() & 0x7FFFFFFF);
+  const preamble = Buffer.alloc(WEAPON_PREAMBLE_SIZE, 0);
+  const weapon: WeaponItem = { preamble, itemId, craftplanId, itemUID: uid, quantity, durability, itemLevel: level };
+  const quickSlots = [...save.quickSlots, weapon];
+  return {
+    ...save,
+    quickSlots,
+    location: { ...save.location, quickSlotCount: quickSlots.length },
+  };
+}
+
+/**
+ * Change the player's character class.
+ * Updates both charClassId and charTypeKey to keep them in sync.
+ */
+export function setCharacterClass(save: SaveFile, classId: 0 | 1 | 2 | 3): SaveFile {
+  const keyMap: Record<number, string> = {
+    0: "Type;XianMei",
+    1: "Type;Logan",
+    2: "Type;SamB",
+    3: "Type;Purna",
+  };
+  return {
+    ...save,
+    location: {
+      ...save.location,
+      charClassId: classId,
+      charTypeKey: keyMap[classId] ?? save.location.charTypeKey,
+    },
+  };
+}
+
+/**
+ * Set the player's spawn location (map + checkpoint + spawn point).
+ * Pass undefined to leave a field unchanged.
+ *
+ * Known map names: Hotel, ACT1A, ACT2A, ACT3A, ACT4A
+ */
+export function setCheckpoint(
+  save: SaveFile,
+  mapName?: string,
+  checkpoint?: string,
+  spawnPoint?: string,
+  checkpoint2?: string
+): SaveFile {
+  return {
+    ...save,
+    location: {
+      ...save.location,
+      ...(mapName     !== undefined ? { mapName }     : {}),
+      ...(checkpoint  !== undefined ? { checkpoint }  : {}),
+      ...(spawnPoint  !== undefined ? { spawnPoint }  : {}),
+      ...(checkpoint2 !== undefined ? { checkpoint2 } : {}),
+    },
+  };
+}
+
+/**
+ * Apply a "God Mode" preset in one call:
+ *  Level 60 · $9,999,999 · Max HP · Max weapon durability
+ *  Max inventory (999) · All collectibles unlocked
+ *  All skills unlocked · Map fog cleared
+ */
+export function applyGodMode(save: SaveFile): SaveFile {
+  let s = setLevel(save, 60);
+  s = setMoney(s, 9_999_999);
+  s = setHP(s, 9999, 9999);
+  s = maxAllWeaponDurability(s);
+  s = maxAllInventory(s, 999);
+  s = unlockAllCollectibles(s);
+  s = unlockAllSkills(s);
+  s = clearMapFog(s);
+  return s;
 }
 
