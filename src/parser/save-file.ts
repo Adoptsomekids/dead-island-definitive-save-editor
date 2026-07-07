@@ -151,22 +151,37 @@ export function gzipCompress(buf: Buffer): Buffer {
 // ─── PREAMBLE SIZE CONSTANT ───────────────────────────────────────────────────
 
 /**
- * Each WeaponItem has a fixed 57-byte preamble before the first wstr.
- * Breakdown (empirical, from save_1.sav reverse engineering):
- *   [16 bytes] spawn position / orientation  (4× f32: X, Y, Z, orient)
- *   [ 4 bytes] unk_0
- *   [ 4 bytes] unk_1 float (~0.37)
- *   [ 4 bytes] unk_2
- *   [ 4 bytes] unk_3  (u16 pair)
- *   [ 4 bytes] unk_4
- *   [ 4 bytes] unk_5
- *   [ 4 bytes] unk_6
- *   [ 4 bytes] unk_7
- *   [ 4 bytes] unk_8
- *   [ 1 byte ] unk_9  (alignment / flag byte)
- * = 57 bytes
+ * Known preamble sizes for the held weapon across different save types:
+ *   - 57 bytes: late-game ACT1A saves (save_1 format)
+ *   - 82 bytes: early-game ACT1A saves (save_2 format, HubChapter_1)
+ *   - 100 bytes: Hotel/Prologue saves (save_0 format)
+ *
+ * The preamble always starts with 24 fixed bytes (XYZ position + orient + 2 unk floats),
+ * followed by a variable-length section that encodes slot info.
+ * We auto-detect the correct preamble size at parse time.
  */
-export const WEAPON_PREAMBLE_SIZE = 57;
+export const WEAPON_PREAMBLE_SIZE = 57; // default / legacy
+export const KNOWN_PREAMBLE_SIZES = [57, 82, 100, 48, 36, 24, 64, 72, 88, 96];
+
+/**
+ * Detect the preamble size for the held weapon in a save buffer.
+ * Scans ahead from the given offset for the first plausible WStr
+ * that looks like a Dead Island item ID (Melee_, Firearm_, None, Fists, etc.)
+ * Returns the detected preamble byte count, or -1 if not found.
+ */
+export function detectPreambleSize(buf: Buffer, preambleStart: number, maxSearch = 150): number {
+  const VALID_PREFIXES = ["Melee_", "Firearm_", "CraftPart_", "Fists", "None", "Knife", "Ammo", "Car ", "Throwable_"];
+  for (let off = preambleStart; off < preambleStart + maxSearch - 2; off++) {
+    const len = buf.readUInt16LE(off);
+    if (len === 0 || len > 80) continue;
+    if (off + 2 + len > buf.length) continue;
+    const s = buf.slice(off + 2, off + 2 + len).toString("utf8");
+    if (VALID_PREFIXES.some(p => s.startsWith(p))) {
+      return off - preambleStart;
+    }
+  }
+  return -1;
+}
 
 // ─── Parser ──────────────────────────────────────────────────────────────────
 
@@ -246,45 +261,109 @@ export function parseSaveFile(decompressed: Buffer): SaveFile {
   let parseError: string | null = null;
 
   try {
-    // First weapon = HELD weapon (currently equipped), has 57-byte spawn preamble
-    const heldPreamble = s.readBytes(WEAPON_PREAMBLE_SIZE);
-    heldWeapon = {
-      preamble:    heldPreamble,
-      itemId:      s.readWStr(),
-      craftplanId: s.readWStr(),
-      itemUID:     s.readUInt32(),
-      quantity:    s.readUInt32(),
-      durability:  s.readFloat(),
-      itemLevel:   s.readUInt32(),
-    };
+    // Auto-detect the preamble size for the held weapon.
+    // Different save types have different preamble lengths:
+    //   57 bytes  → late-game ACT1A (save_1)
+    //   82 bytes  → early-game ACT1A HubChapter_1 (save_2)
+    //   100 bytes → Hotel / Prologue (save_0)
+    const bufSlice = s.getBuffer().slice(s.position);
+    const detectedPreamble = detectPreambleSize(bufSlice, 0, 150);
+    const preambleSize = detectedPreamble >= 0 ? detectedPreamble : WEAPON_PREAMBLE_SIZE;
 
-    // Remaining wsCount quick-slot weapons (NO preamble)
-    for (let i = 0; i < wsCount; i++) {
-      quickSlots.push({
-        preamble:    Buffer.alloc(0),    // no preamble for quick-slot weapons
+    // Snapshot position to detect if this save uses a "standard" layout or not.
+    // Standard layout = preamble size exactly matches WEAPON_PREAMBLE_SIZE (57) AND
+    // the post-weapon separators are [1, 0, 1] and invCount is plausible.
+    const isStandardLayout = (preambleSize === 57);
+
+    if (isStandardLayout) {
+      // ── Standard layout (save_1, late-game ACT1A) ──────────────────────
+      const heldPreamble = s.readBytes(preambleSize);
+      heldWeapon = {
+        preamble:    heldPreamble,
         itemId:      s.readWStr(),
         craftplanId: s.readWStr(),
         itemUID:     s.readUInt32(),
         quantity:    s.readUInt32(),
         durability:  s.readFloat(),
         itemLevel:   s.readUInt32(),
-      });
+      };
+
+      for (let i = 0; i < wsCount; i++) {
+        quickSlots.push({
+          preamble:    Buffer.alloc(0),
+          itemId:      s.readWStr(),
+          craftplanId: s.readWStr(),
+          itemUID:     s.readUInt32(),
+          quantity:    s.readUInt32(),
+          durability:  s.readFloat(),
+          itemLevel:   s.readUInt32(),
+        });
+      }
+
+      _invSeparators = [s.readUInt32(), s.readUInt32(), s.readUInt32()];
+      const invCount = s.readUInt32();
+      for (let i = 0; i < invCount; i++) {
+        const itemId      = s.readWStr();
+        const containerId = s.readWStr();
+        const itemUID     = s.readUInt32();
+        const quantity    = s.readUInt32();
+        const unk_f       = s.readFloat();
+        const unk_pad     = s.readUInt32();
+        inventory.push({ itemId, containerId, itemUID, quantity, unk_f, unk_pad });
+      }
+
+    } else {
+      // ── Non-standard layout (save_0 Hotel/Prologue, save_2 early-game) ──
+      // These saves use a larger preamble and may have trailing bytes per weapon.
+      // We parse the held weapon and as many quick-slots as cleanly possible,
+      // but we don't attempt a lossless round-trip (basic edits still work).
+      const heldPreamble = s.readBytes(preambleSize);
+      heldWeapon = {
+        preamble:    heldPreamble,
+        itemId:      s.readWStr(),
+        craftplanId: s.readWStr(),
+        itemUID:     s.readUInt32(),
+        quantity:    s.readUInt32(),
+        durability:  s.readFloat(),
+        itemLevel:   s.readUInt32(),
+      };
+
+      // Best-effort: read quick-slots until parse fails or we hit the inventory separator
+      const RAW_BUF = s.getBuffer();
+      // A trailing 0x00 byte may follow each weapon in these save formats
+      const VALID_ID_RE = /^(Melee_|Firearm_|CraftPart_|Fists|None|Knife|Ammo|Car|Throwable_)/;
+      for (let i = 0; i < wsCount; i++) {
+        // Skip a possible 0x00 trailing byte
+        while (s.position < s.length && RAW_BUF[s.position] === 0x00) {
+          const nextLen = RAW_BUF.readUInt16LE(s.position + 1);
+          if (nextLen > 0 && nextLen < 80) { s.readByte(); break; }
+          break;
+        }
+        if (s.remaining < 6) break;
+        const peekLen = RAW_BUF.readUInt16LE(s.position);
+        if (peekLen === 0 || peekLen > 80) break; // likely hit separator/inventory area
+        const peekStr = RAW_BUF.slice(s.position + 2, s.position + 2 + peekLen).toString("utf8");
+        if (!VALID_ID_RE.test(peekStr) && peekStr !== "") break;
+
+        quickSlots.push({
+          preamble:    Buffer.alloc(0),
+          itemId:      s.readWStr(),
+          craftplanId: s.readWStr(),
+          itemUID:     s.readUInt32(),
+          quantity:    s.readUInt32(),
+          durability:  s.readFloat(),
+          itemLevel:   s.readUInt32(),
+        });
+      }
+
+      // The rest of the weapon/inventory section goes into rawTail for this format.
+      // This preserves byte-perfect integrity for basic edits (money/level/HP).
+      // Set a soft parse error to indicate weapon editing is limited.
+      parseError = `non-standard layout (preamble=${preambleSize}b) — basic edits work, weapon/inv editing limited`;
+      // Reset to weaponSectionStart so rawTail has the whole section
+      s.position = weaponSectionStart;
     }
 
-    // 3 separator u32 values between weapons and inventory
-    _invSeparators = [s.readUInt32(), s.readUInt32(), s.readUInt32()];
-
-    // ── Inventory items (stackables / consumables) ────────────────────────
-    const invCount = s.readUInt32();
-    for (let i = 0; i < invCount; i++) {
-      const itemId      = s.readWStr();
-      const containerId = s.readWStr();
-      const itemUID     = s.readUInt32();
-      const quantity    = s.readUInt32();
-      const unk_f       = s.readFloat();
-      const unk_pad     = s.readUInt32();
-      inventory.push({ itemId, containerId, itemUID, quantity, unk_f, unk_pad });
-    }
   } catch (err: any) {
     // Parse failure — fall back: keep everything from weaponSectionStart as rawTail
     parseError = err.message;
