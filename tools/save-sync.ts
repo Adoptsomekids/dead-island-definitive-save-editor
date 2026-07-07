@@ -417,8 +417,10 @@ async function signedXblPost(
     "Signature": sig,
     ...extraHeaders,
   }, bodyStr);
-  if (r.status !== 200) throw new Error(`${url} → ${r.status}: ${r.body.slice(0, 300)}`);
-  return JSON.parse(r.body);
+  if (r.status !== 200) throw new Error(`${url} → ${r.status}: ${r.body.slice(0, 500)}`);
+  let parsed: any;
+  try { parsed = JSON.parse(r.body); } catch { throw new Error(`${url} → ${r.status}: non-JSON: ${r.body.slice(0,200)}`); }
+  return parsed;
 }
 
 /** Obtain a Device token. Requires an MSA access token + a fresh ECDSA key pair.
@@ -429,11 +431,17 @@ async function fetchDeviceToken(
   privateKey: crypto.KeyObject,
   publicKey: crypto.KeyObject
 ): Promise<XToken> {
-  // Export the raw x,y coordinates from the public key
-  const raw    = publicKey.export({ type: "spki", format: "der" });
-  // SPKI for P-256 is 91 bytes: 26-byte header + 1 uncompressed flag + 32 x + 32 y
-  const x = raw.slice(27, 59).toString("base64url");
-  const y = raw.slice(59, 91).toString("base64url");
+  // Export raw x,y from the EC public key via SPKI DER encoding.
+  // SPKI for P-256 is always 91 bytes:
+  //   [26 bytes algo header][1 byte 0x04 uncompressed flag][32 x][32 y]
+  const spki = publicKey.export({ type: "spki", format: "der" });
+
+  // Safety: validate the key is the right size
+  if (spki.length !== 91) {
+    throw new Error(`Unexpected SPKI length ${spki.length} for P-256 key (expected 91)`);
+  }
+  const x = spki.slice(27, 59).toString("base64url");
+  const y = spki.slice(59, 91).toString("base64url");
 
   const proofKey = { kty: "EC", alg: "ES256", use: "sig", crv: "P-256", x, y };
 
@@ -445,7 +453,6 @@ async function fetchDeviceToken(
       SiteName: "user.auth.xboxlive.com",
       RpsTicket: `t=${msaToken}`,
       ProofKey: proofKey,
-      Version: "0.0.0",
     }
   }, "", privateKey);
 }
@@ -1256,16 +1263,47 @@ async function cmdCsPull(): Promise<void> {
       continue;
     }
 
-    // Full download: get SAS URL for each atom and download binary
-    // This requires the full device+title token
+    // Full download: get SAS URL for each atom and download binary.
+    // This requires the full device+title XSTS token bundle.
+    // Note: device.auth.xboxlive.com requires proof-of-console authentication
+    // that is only available on official Xbox SDK clients. This means binary blob
+    // download via device token does NOT work from macOS (no Xbox SDK).
+    //
+    // Alternatives:
+    //   A) Use Xbox App on Windows → WGS folder → --bridge-import
+    //   B) Use Xbox Dev Mode + SaveBridge → --cs-download --xbox-ip <ip>
+    //   C) Capture SAS URL via Fiddler on Windows → --sas-download --url <sas_url>
     let fullHeader: string;
     try {
       const fullAuth = await getFullAuthHeader();
       fullHeader = fullAuth.header;
     } catch (e: any) {
-      console.log(`\n  ⚠ Full atom download requires legacy login:`);
-      console.log(`    npx ts-node tools/save-sync.ts --login-legacy`);
-      console.log(`    Then: --cs-pull --out ./saves --full`);
+      const msg = (e as Error).message ?? String(e);
+      if (msg.includes("Legacy Xbox Live token not found") || msg.includes("login-legacy")) {
+        console.log(`\n  ⚠ Full atom download requires legacy login:`);
+        console.log(`    npx ts-node tools/save-sync.ts --login-legacy`);
+        console.log(`    Then: --cs-pull --out ./saves --full`);
+      } else if (msg.includes("device.auth.xboxlive.com") || msg.includes("400")) {
+        // Device auth endpoint rejected — this is the known macOS limitation
+        console.log(`\n  ⚠ Xbox device authentication failed (HTTP 400 from device.auth.xboxlive.com).`);
+        console.log(`  This endpoint requires proof-of-console auth not available from macOS.`);
+        console.log(`\n  ── Alternative download methods ──────────────────────────────────────`);
+        console.log(`  A) Xbox App on Windows PC:`);
+        console.log(`     Sync saves → copy from:`);
+        console.log(`     %LOCALAPPDATA%\\Packages\\Microsoft.GamingApp_8wekyb3d8bbwe\\SystemAppData\\wgs\\`);
+        console.log(`     Then: npx ts-node tools/save-sync.ts --bridge-import --wgs <path>`);
+        console.log(`\n  B) Xbox in Dev Mode + SaveBridge:`);
+        console.log(`     Enable Dev Mode → deploy SaveBridge UWP →`);
+        console.log(`     npx ts-node tools/save-sync.ts --cs-download --xbox-ip <ip>`);
+        console.log(`\n  C) Fiddler SAS URL capture (Windows):`);
+        console.log(`     Proxy Xbox app → capture POST /atoms response → copy blobUri`);
+        console.log(`     Then: npx ts-node tools/save-sync.ts --sas-download --url "<blobUri>" --out ./saves/save_1.sav.bin`);
+        console.log(`\n  ──────────────────────────────────────────────────────────────────────`);
+        console.log(`  Your existing saves in ./saves/ are ready to edit:`);
+        console.log(`    save_0.sav.bin, save_1.sav.bin, save_2.sav.bin`);
+      } else {
+        console.log(`\n  ✗ getFullAuthHeader failed: ${msg}`);
+      }
       return;
     }
 
@@ -1325,9 +1363,48 @@ async function cmdLoginLegacy(): Promise<void> {
     liveRefreshToken: tok.refresh_token,
     liveExpiry: Date.now() + tok.expires_in * 1000,
   });
-  console.log("✔ Legacy Xbox Live token cached!");
+  console.log("\n✔ Legacy Xbox Live token cached!");
   console.log(`  Cached at: ${CACHE_FILE}`);
-  console.log("\n✔ You can now run --cs-pull --out ./saves --full to download binary save data.");
+  console.log(`  Token expires in: ${Math.floor(tok.expires_in / 3600)}h`);
+  console.log(`\n  NOTE: The legacy token is stored and will be used for device auth.`);
+  console.log(`  However, device.auth.xboxlive.com may reject requests from macOS`);
+  console.log(`  (no Xbox SDK on Mac — the device auth endpoint requires proof-of-console).`);
+  console.log(`\n  If --cs-pull --full fails with device auth error, use one of:`);
+  console.log(`  A) Xbox App on Windows → WGS folder → --bridge-import --wgs <path>`);
+  console.log(`  B) Xbox Dev Mode + SaveBridge → --cs-download --xbox-ip <ip>`);
+  console.log(`  C) Fiddler SAS URL capture → --sas-download --url "<blobUri>" --out ./saves/save_1.sav.bin`);
+  console.log(`\n  Your 3 existing saves in ./saves/ are fully usable right now!`);
+  console.log(`  → npx ts-node tools/web-editor-server.ts --port=3000 --saves=./saves`);
+}
+
+/** Download a binary atom directly from an Azure Blob SAS URL.
+ *  Use this when you've captured the blobUri from Fiddler/proxy. */
+async function cmdSasDownload(): Promise<void> {
+  const sasUrl = getArg("--url");
+  const outFile = getArg("--out");
+  if (!sasUrl) { console.error("--url <sas_url> required"); process.exit(1); }
+  if (!outFile) { console.error("--out <output_file.bin> required"); process.exit(1); }
+
+  console.log(`\nDownloading from SAS URL...`);
+  console.log(`  → ${outFile}`);
+
+  try {
+    const data = await downloadFromSasUrl(sasUrl);
+    fs.mkdirSync(path.dirname(path.resolve(outFile)), { recursive: true });
+    fs.writeFileSync(outFile, data);
+    console.log(`✔ Downloaded ${data.length.toLocaleString()} bytes → ${outFile}`);
+
+    // Try to decompress and inspect
+    const { maybeDecompress, parseSaveFile } = require("../src/parser/save-file");
+    const dec = maybeDecompress(data);
+    try {
+      const save = parseSaveFile(dec);
+      console.log(`  Level ${save.header.level} | $${save.location.money.toLocaleString()} | ${save.location.mapName}`);
+    } catch {}
+  } catch (e: any) {
+    console.error(`✗ Download failed: ${(e as Error).message}`);
+    process.exit(1);
+  }
 }
 
 async function cmdList(): Promise<void> {
@@ -1631,6 +1708,7 @@ async function main(): Promise<void> {
   if (hasFlag("--login-legacy"))  { await cmdLoginLegacy();  return; }
   if (hasFlag("--cs-pull"))       { await cmdCsPull();       return; }
   if (hasFlag("--cs-push"))       { await cmdCsPush();       return; }
+  if (hasFlag("--sas-download"))  { await cmdSasDownload();  return; }
   if (hasFlag("--list"))          { await cmdList();         return; }
   if (hasFlag("--list-steam"))    { cmdListSteam();          return; }
   if (hasFlag("--bridge"))        { await cmdBridge();       return; }
