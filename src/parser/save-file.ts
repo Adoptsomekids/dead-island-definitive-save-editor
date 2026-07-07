@@ -674,5 +674,3 @@ export function setStorageItem(
   return { ...save, storage: [...save.storage, newItem] };
 }
 
-// Re-export StorageItem for convenience
-export type { StorageItem };

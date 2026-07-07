@@ -1,163 +1,331 @@
 // src/editor/save-editor.ts
-// High-level Save Editor API — load, mutate, save
+// Dead Island DE — High-level Save Editor API (v2)
+//
+// Wraps the low-level parser/serializer with a convenient class-based API.
+// All property access is strongly typed against the real SaveFile structure.
 
 import * as fs from "fs";
-import { SaveFile, parseSaveFile, serializeSaveFile } from "../parser/save-file";
-import { PlayerData } from "../parser/player";
-import { SkillsData, unlockAllSkills, resetSkills } from "../parser/skills";
-import { InventoryData, InventoryItem } from "../parser/inventory";
 import {
-  CollectiblesData,
-  unlockAllCollectibles,
-} from "../parser/collectibles";
+  SaveFile,
+  SaveHeader,
+  SaveLocation,
+  WeaponItem,
+  InventoryItem,
+  StorageItem,
+  CHARACTER_CLASS,
+  parseSaveFile,
+  serializeSaveFile,
+  maybeDecompress,
+  gzipCompress,
+  setMoney,
+  setLevel,
+  setHP,
+  maxAllWeaponDurability,
+  maxAllInventory,
+  maxStorageDurability,
+  setInventoryItemQty,
+  setStorageItemQty,
+  setStorageItem,
+  replaceQuickSlotWeapon,
+  setHeldWeapon,
+} from "../parser/save-file";
+
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+export interface PlayerInfo {
+  level: number;
+  maxHP: number;
+  currHP: number;
+  money: number;
+  charName: string;
+  charClassId: number;
+  mapName: string;
+  checkpoint: string;
+  saveDate: string;
+  saveTime: string;
+}
+
+export interface EditOptions {
+  /** Set wallet amount (0–9,999,999) */
+  money?: number;
+  /** Set player level (1–60) */
+  level?: number;
+  /** Set max HP */
+  maxHP?: number;
+  /** Set current HP (defaults to maxHP if omitted) */
+  currHP?: number;
+  /** Max out all weapon durability */
+  maxAllWeaponDurability?: boolean;
+  /** Max out all inventory item quantities */
+  maxAllInventory?: boolean;
+  /** Max out all storage weapon durability */
+  maxStorageDurability?: boolean;
+}
+
+// ─── SaveEditor class ─────────────────────────────────────────────────────────
 
 export class SaveEditor {
   private _save: SaveFile | null = null;
+  private _wasGzipped = false;
 
-  // ── Load / Save ───────────────────────────────────────────────────────────
+  // ── Load ───────────────────────────────────────────────────────────────────
 
-  async loadFile(filePath: string): Promise<void> {
-    const buffer = fs.readFileSync(filePath);
-    this._save = await parseSaveFile(buffer);
+  /** Load a save file from disk. Auto-detects gzip compression. */
+  loadFile(filePath: string): void {
+    const raw = fs.readFileSync(filePath);
+    this._wasGzipped = raw[0] === 0x1f && raw[1] === 0x8b;
+    const dec = maybeDecompress(raw);
+    this._save = parseSaveFile(dec);
   }
 
-  async loadBuffer(buffer: Buffer): Promise<void> {
-    this._save = await parseSaveFile(buffer);
+  /** Load a save from a Buffer. Auto-detects gzip compression. */
+  loadBuffer(buffer: Buffer): void {
+    this._wasGzipped = buffer[0] === 0x1f && buffer[1] === 0x8b;
+    const dec = maybeDecompress(buffer);
+    this._save = parseSaveFile(dec);
   }
 
-  async saveFile(filePath: string): Promise<void> {
-    const buffer = await this.saveBuffer();
-    fs.writeFileSync(filePath, buffer);
-  }
+  // ── Save ───────────────────────────────────────────────────────────────────
 
-  async saveBuffer(): Promise<Buffer> {
+  /**
+   * Serialize the current state to a Buffer.
+   * Re-applies gzip compression if the original was gzipped.
+   */
+  toBuffer(): Buffer {
     this.assertLoaded();
-    return serializeSaveFile(this._save!);
+    const raw = serializeSaveFile(this._save!);
+    return this._wasGzipped ? gzipCompress(raw) : raw;
   }
 
-  // ── Player ────────────────────────────────────────────────────────────────
+  /** Write the current state to disk. */
+  saveFile(filePath: string): void {
+    fs.writeFileSync(filePath, this.toBuffer());
+  }
 
-  getPlayer(): PlayerData {
+  // ── Read-only accessors ────────────────────────────────────────────────────
+
+  get header(): Readonly<SaveHeader> {
     this.assertLoaded();
-    return { ...this._save!.player };
+    return this._save!.header;
   }
 
-  setPlayer(data: Partial<PlayerData>): void {
+  get location(): Readonly<SaveLocation> {
     this.assertLoaded();
-    this._save!.player = { ...this._save!.player, ...data };
+    return this._save!.location;
   }
 
-  setGodMode(enabled: boolean): void {
+  get heldWeapon(): Readonly<WeaponItem> {
     this.assertLoaded();
-    if (enabled) {
-      this._save!.player.health = 99999;
-      this._save!.player.maxHealth = 99999;
-    }
+    return this._save!.heldWeapon;
   }
 
-  setMaxLevel(): void {
+  get quickSlots(): ReadonlyArray<WeaponItem> {
     this.assertLoaded();
-    this._save!.player.level = 60;
-    this._save!.player.experience = 9999999;
-    this._save!.player.skillPoints = 49; // max allocatable
+    return this._save!.quickSlots;
   }
 
-  setMaxCash(): void {
-    this.assertLoaded();
-    this._save!.player.cash = 9999999;
-  }
-
-  // ── Skills ────────────────────────────────────────────────────────────────
-
-  getSkills(): SkillsData {
-    this.assertLoaded();
-    return { ...this._save!.skills };
-  }
-
-  setSkills(data: Partial<SkillsData>): void {
-    this.assertLoaded();
-    this._save!.skills = { ...this._save!.skills, ...data };
-  }
-
-  unlockAllSkills(): void {
-    this.assertLoaded();
-    this._save!.skills = unlockAllSkills(this._save!.skills);
-  }
-
-  resetSkills(): void {
-    this.assertLoaded();
-    const { skills, refundedPoints } = resetSkills(
-      this._save!.skills,
-      this._save!.player.skillPoints
-    );
-    this._save!.skills = skills;
-    this._save!.player.skillPoints = refundedPoints;
-  }
-
-  // ── Inventory ─────────────────────────────────────────────────────────────
-
-  getInventory(): InventoryData {
+  get inventory(): ReadonlyArray<InventoryItem> {
     this.assertLoaded();
     return this._save!.inventory;
   }
 
-  addItem(item: InventoryItem, toStorage: boolean = false): void {
+  get storage(): ReadonlyArray<StorageItem> {
     this.assertLoaded();
-    if (toStorage) {
-      this._save!.inventory.storageItems.push(item);
-    } else {
-      this._save!.inventory.items.push(item);
+    return this._save!.storage;
+  }
+
+  get rawTail(): Buffer {
+    this.assertLoaded();
+    return this._save!.rawTail;
+  }
+
+  get parseError(): string | undefined {
+    this.assertLoaded();
+    return this._save!._parseError;
+  }
+
+  /** True if the file was gzip-compressed (all Xbox Live atoms are). */
+  get wasGzipped(): boolean { return this._wasGzipped; }
+
+  // ── Player convenience ─────────────────────────────────────────────────────
+
+  /** Returns a summary of key player attributes. */
+  getPlayerInfo(): PlayerInfo {
+    this.assertLoaded();
+    const h = this._save!.header;
+    const l = this._save!.location;
+    return {
+      level:       h.level,
+      maxHP:       h.maxHP,
+      currHP:      h.currHP,
+      money:       l.money,
+      charName:    CHARACTER_CLASS[l.charClassId] ?? `Unknown(${l.charClassId})`,
+      charClassId: l.charClassId,
+      mapName:     l.mapName,
+      checkpoint:  l.checkpoint,
+      saveDate:    `${l.saveYear}-${String(l.saveMonth).padStart(2,"0")}-${String(l.saveDay||1).padStart(2,"0")}`,
+      saveTime:    `${String(l.saveHour).padStart(2,"0")}:${String(l.saveMinute).padStart(2,"0")}`,
+    };
+  }
+
+  // ── Player edits ───────────────────────────────────────────────────────────
+
+  /** Set the player's wallet amount (0–9,999,999). */
+  setMoney(amount: number): this {
+    this.assertLoaded();
+    this._save = setMoney(this._save!, amount);
+    return this;
+  }
+
+  /** Set the player level (1–60). */
+  setLevel(level: number): this {
+    this.assertLoaded();
+    this._save = setLevel(this._save!, level);
+    return this;
+  }
+
+  /** Set current and max HP. */
+  setHP(maxHP: number, currHP?: number): this {
+    this.assertLoaded();
+    this._save = setHP(this._save!, maxHP, currHP);
+    return this;
+  }
+
+  /** Convenience: apply god-mode level HP. */
+  setGodMode(): this {
+    return this.setHP(99999, 99999);
+  }
+
+  /** Convenience: set max money ($9,999,999). */
+  setMaxMoney(): this {
+    return this.setMoney(9_999_999);
+  }
+
+  /** Convenience: set max level (60). */
+  setMaxLevel(): this {
+    return this.setLevel(60);
+  }
+
+  // ── Weapon edits ───────────────────────────────────────────────────────────
+
+  /** Update the held (equipped) weapon's properties. */
+  editHeldWeapon(changes: Partial<Pick<WeaponItem, "itemId"|"craftplanId"|"durability"|"quantity"|"itemLevel">>): this {
+    this.assertLoaded();
+    this._save = setHeldWeapon(this._save!, changes);
+    return this;
+  }
+
+  /** Replace a quick-slot weapon by index (0-based). */
+  replaceQuickSlotWeapon(
+    idx: number,
+    itemId: string,
+    craftplanId = "",
+    level = 3,
+    durability = 100.0,
+    quantity = 1
+  ): this {
+    this.assertLoaded();
+    this._save = replaceQuickSlotWeapon(this._save!, idx, itemId, craftplanId, level, durability, quantity);
+    return this;
+  }
+
+  /** Max out durability on all equipped and quick-slot weapons. */
+  maxAllWeaponDurability(): this {
+    this.assertLoaded();
+    this._save = maxAllWeaponDurability(this._save!);
+    return this;
+  }
+
+  // ── Inventory edits ────────────────────────────────────────────────────────
+
+  /** Set the quantity of a specific inventory item by itemId. */
+  setInventoryItemQty(itemId: string, quantity: number): this {
+    this.assertLoaded();
+    this._save = setInventoryItemQty(this._save!, itemId, quantity);
+    return this;
+  }
+
+  /** Max out all stackable inventory item quantities (999 each). */
+  maxAllInventory(maxQty = 999): this {
+    this.assertLoaded();
+    this._save = maxAllInventory(this._save!, maxQty);
+    return this;
+  }
+
+  // ── Storage chest edits ────────────────────────────────────────────────────
+
+  /** Set the quantity of a storage chest item by itemId. */
+  setStorageItemQty(itemId: string, quantity: number): this {
+    this.assertLoaded();
+    this._save = setStorageItemQty(this._save!, itemId, quantity);
+    return this;
+  }
+
+  /** Max out durability on all storage chest weapons. */
+  maxStorageDurability(): this {
+    this.assertLoaded();
+    this._save = maxStorageDurability(this._save!);
+    return this;
+  }
+
+  /** Add or update a storage chest item. */
+  setStorageItem(
+    itemId: string,
+    craftplanId: string,
+    quantity: number,
+    durability: number,
+    itemLevel: number,
+    itemUID = 0
+  ): this {
+    this.assertLoaded();
+    this._save = setStorageItem(this._save!, itemId, craftplanId, quantity, durability, itemLevel, itemUID);
+    return this;
+  }
+
+  // ── Batch edits ────────────────────────────────────────────────────────────
+
+  /**
+   * Apply multiple edits in one call. Returns a summary of applied changes.
+   * Example:
+   *   editor.applyEdits({ money: 9999999, level: 60, maxAllWeaponDurability: true })
+   */
+  applyEdits(opts: EditOptions): string[] {
+    this.assertLoaded();
+    const changes: string[] = [];
+
+    if (opts.money !== undefined) {
+      this.setMoney(opts.money);
+      changes.push(`money → $${opts.money.toLocaleString()}`);
     }
+    if (opts.level !== undefined) {
+      this.setLevel(opts.level);
+      changes.push(`level → ${opts.level}`);
+    }
+    if (opts.maxHP !== undefined) {
+      this.setHP(opts.maxHP, opts.currHP);
+      changes.push(`HP → ${opts.maxHP}/${opts.currHP ?? opts.maxHP}`);
+    }
+    if (opts.maxAllWeaponDurability) {
+      this.maxAllWeaponDurability();
+      changes.push("all weapon durability → 100");
+    }
+    if (opts.maxAllInventory) {
+      this.maxAllInventory();
+      changes.push("all inventory qty → 999");
+    }
+    if (opts.maxStorageDurability) {
+      this.maxStorageDurability();
+      changes.push("all storage durability → 100");
+    }
+
+    return changes;
   }
 
-  removeItem(index: number, fromStorage: boolean = false): void {
-    this.assertLoaded();
-    const list = fromStorage
-      ? this._save!.inventory.storageItems
-      : this._save!.inventory.items;
-    list.splice(index, 1);
-  }
-
-  setItemDurability(index: number, durability: number, inStorage: boolean = false): void {
-    this.assertLoaded();
-    const list = inStorage
-      ? this._save!.inventory.storageItems
-      : this._save!.inventory.items;
-    if (index < 0 || index >= list.length) throw new RangeError(`Item index ${index} out of range`);
-    list[index].durability = Math.min(1.0, Math.max(0.0, durability));
-  }
-
-  maxAllDurability(): void {
-    this.assertLoaded();
-    const maxDur = (item: InventoryItem) => { item.durability = 1.0; };
-    this._save!.inventory.items.forEach(maxDur);
-    this._save!.inventory.storageItems.forEach(maxDur);
-  }
-
-  setAmmo(index: number, quantity: number, inStorage: boolean = false): void {
-    this.assertLoaded();
-    const list = inStorage
-      ? this._save!.inventory.storageItems
-      : this._save!.inventory.items;
-    if (index < 0 || index >= list.length) throw new RangeError(`Item index ${index} out of range`);
-    list[index].quantity = Math.min(65535, Math.max(0, quantity));
-  }
-
-  // ── Collectibles ──────────────────────────────────────────────────────────
-
-  getCollectibles(): CollectiblesData {
-    this.assertLoaded();
-    return { ...this._save!.collectibles };
-  }
-
-  unlockAllCollectibles(): void {
-    this.assertLoaded();
-    this._save!.collectibles = unlockAllCollectibles(this._save!.collectibles);
-  }
-
-  // ── Internals ─────────────────────────────────────────────────────────────
+  // ── Internal ──────────────────────────────────────────────────────────────
 
   private assertLoaded(): void {
-    if (!this._save) throw new Error("No save file loaded. Call loadFile() or loadBuffer() first.");
+    if (!this._save) {
+      throw new Error("No save file loaded. Call loadFile() or loadBuffer() first.");
+    }
   }
 }
