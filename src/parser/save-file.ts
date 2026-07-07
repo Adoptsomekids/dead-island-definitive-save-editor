@@ -107,6 +107,8 @@ export interface SaveFile {
   inventory: InventoryItem[];
   /** Raw tail bytes — everything after inventory until EOF (skills, quests, fog, etc.) */
   rawTail: Buffer;
+  /** If set, the weapon/inventory section could not be fully parsed (e.g. prologue saves) */
+  _parseError?: string;
 }
 
 // ─── Character class helpers ──────────────────────────────────────────────────
@@ -120,6 +122,7 @@ export const CHARACTER_CLASS: Record<number, string> = {
 
 export const CHARACTER_CLASS_BY_KEY: Record<string, number> = {
   "Type;XianMei": 0,
+  "Type;Xian": 0,    // alternate spelling seen in some saves
   "Type;Logan": 1,
   "Type;SamB": 2,
   "Type;Purna": 3,
@@ -231,51 +234,63 @@ export function parseSaveFile(decompressed: Buffer): SaveFile {
   };
 
   // ── Weapon sections ──────────────────────────────────────────────────────
+  // Save a snapshot of position BEFORE reading sentinel so we can fall back
+  const weaponSectionStart = s.position;
   const quickSlotSentinel = s.readUInt32(); // 0xFFFFFFFF
   const wsCount = s.readUInt32();
 
-  // First weapon = HELD weapon (currently equipped), has 57-byte spawn preamble
-  const heldPreamble = s.readBytes(WEAPON_PREAMBLE_SIZE);
-  const heldWeapon: WeaponItem = {
-    preamble:    heldPreamble,
-    itemId:      s.readWStr(),
-    craftplanId: s.readWStr(),
-    itemUID:     s.readUInt32(),
-    quantity:    s.readUInt32(),
-    durability:  s.readFloat(),
-    itemLevel:   s.readUInt32(),
-  };
-
-  // Remaining wsCount quick-slot weapons (NO preamble)
+  let heldWeapon: WeaponItem;
   const quickSlots: WeaponItem[] = [];
-  for (let i = 0; i < wsCount; i++) {
-    quickSlots.push({
-      preamble:    Buffer.alloc(0),    // no preamble for quick-slot weapons
+  let _invSeparators: [number, number, number] = [1, 0, 1];
+  const inventory: InventoryItem[] = [];
+  let parseError: string | null = null;
+
+  try {
+    // First weapon = HELD weapon (currently equipped), has 57-byte spawn preamble
+    const heldPreamble = s.readBytes(WEAPON_PREAMBLE_SIZE);
+    heldWeapon = {
+      preamble:    heldPreamble,
       itemId:      s.readWStr(),
       craftplanId: s.readWStr(),
       itemUID:     s.readUInt32(),
       quantity:    s.readUInt32(),
       durability:  s.readFloat(),
       itemLevel:   s.readUInt32(),
-    });
-  }
+    };
 
-  // 3 separator u32 values between weapons and inventory
-  const sep0 = s.readUInt32();
-  const sep1 = s.readUInt32();
-  const sep2 = s.readUInt32();
+    // Remaining wsCount quick-slot weapons (NO preamble)
+    for (let i = 0; i < wsCount; i++) {
+      quickSlots.push({
+        preamble:    Buffer.alloc(0),    // no preamble for quick-slot weapons
+        itemId:      s.readWStr(),
+        craftplanId: s.readWStr(),
+        itemUID:     s.readUInt32(),
+        quantity:    s.readUInt32(),
+        durability:  s.readFloat(),
+        itemLevel:   s.readUInt32(),
+      });
+    }
 
-  // ── Inventory items (stackables / consumables) ───────────────────────────
-  const invCount = s.readUInt32();
-  const inventory: InventoryItem[] = [];
-  for (let i = 0; i < invCount; i++) {
-    const itemId      = s.readWStr();
-    const containerId = s.readWStr();
-    const itemUID     = s.readUInt32();
-    const quantity    = s.readUInt32();
-    const unk_f       = s.readFloat();
-    const unk_pad     = s.readUInt32();
-    inventory.push({ itemId, containerId, itemUID, quantity, unk_f, unk_pad });
+    // 3 separator u32 values between weapons and inventory
+    _invSeparators = [s.readUInt32(), s.readUInt32(), s.readUInt32()];
+
+    // ── Inventory items (stackables / consumables) ────────────────────────
+    const invCount = s.readUInt32();
+    for (let i = 0; i < invCount; i++) {
+      const itemId      = s.readWStr();
+      const containerId = s.readWStr();
+      const itemUID     = s.readUInt32();
+      const quantity    = s.readUInt32();
+      const unk_f       = s.readFloat();
+      const unk_pad     = s.readUInt32();
+      inventory.push({ itemId, containerId, itemUID, quantity, unk_f, unk_pad });
+    }
+  } catch (err: any) {
+    // Parse failure — fall back: keep everything from weaponSectionStart as rawTail
+    parseError = err.message;
+    heldWeapon = { preamble: Buffer.alloc(0), itemId: "", craftplanId: "", itemUID: 0, quantity: 0, durability: 0, itemLevel: 0 };
+    // Reset stream to save the weapon section as raw bytes
+    s.position = weaponSectionStart;
   }
 
   // ── Raw tail ─────────────────────────────────────────────────────────────
@@ -283,9 +298,11 @@ export function parseSaveFile(decompressed: Buffer): SaveFile {
 
   return {
     header, location, quickSlotSentinel,
-    heldWeapon, quickSlots,
-    _invSeparators: [sep0, sep1, sep2],
+    heldWeapon: heldWeapon!,
+    quickSlots,
+    _invSeparators,
     inventory, rawTail,
+    _parseError: parseError ?? undefined,
   };
 }
 
@@ -339,44 +356,52 @@ export function serializeSaveFile(save: SaveFile): Buffer {
   s.writeUInt32(loc._raw.invSectCnt);
   s.writeByte(loc._raw.unk_pad);
 
-  // Weapon sections
-  s.writeUInt32(save.quickSlotSentinel);
-  s.writeUInt32(save.quickSlots.length);
+  // Weapon sections + inventory
+  // If the save had a parse error (e.g. prologue format), the rawTail includes these sections.
+  if (!save._parseError) {
+    s.writeUInt32(save.quickSlotSentinel);
+    s.writeUInt32(save.quickSlots.length);
 
-  // Held weapon (with preamble)
-  const hw = save.heldWeapon;
-  s.writeBytes(hw.preamble);
-  s.writeWStr(hw.itemId);
-  s.writeWStr(hw.craftplanId);
-  s.writeUInt32(hw.itemUID);
-  s.writeUInt32(hw.quantity);
-  s.writeFloat(hw.durability);
-  s.writeUInt32(hw.itemLevel);
+    // Held weapon (with preamble)
+    const hw = save.heldWeapon;
+    s.writeBytes(hw.preamble);
+    s.writeWStr(hw.itemId);
+    s.writeWStr(hw.craftplanId);
+    s.writeUInt32(hw.itemUID);
+    s.writeUInt32(hw.quantity);
+    s.writeFloat(hw.durability);
+    s.writeUInt32(hw.itemLevel);
 
-  // Quick-slot weapons (no preamble)
-  for (const w of save.quickSlots) {
-    s.writeWStr(w.itemId);
-    s.writeWStr(w.craftplanId);
-    s.writeUInt32(w.itemUID);
-    s.writeUInt32(w.quantity);
-    s.writeFloat(w.durability);
-    s.writeUInt32(w.itemLevel);
-  }
+    // Quick-slot weapons (no preamble)
+    for (const w of save.quickSlots) {
+      s.writeWStr(w.itemId);
+      s.writeWStr(w.craftplanId);
+      s.writeUInt32(w.itemUID);
+      s.writeUInt32(w.quantity);
+      s.writeFloat(w.durability);
+      s.writeUInt32(w.itemLevel);
+    }
 
-  // Inventory separators
-  s.writeUInt32(save._invSeparators[0]);
-  s.writeUInt32(save._invSeparators[1]);
-  s.writeUInt32(save._invSeparators[2]);
+    // Inventory separators
+    s.writeUInt32(save._invSeparators[0]);
+    s.writeUInt32(save._invSeparators[1]);
+    s.writeUInt32(save._invSeparators[2]);
 
-  // Inventory
-  s.writeUInt32(save.inventory.length);
-  for (const item of save.inventory) {
-    s.writeWStr(item.itemId);
-    s.writeWStr(item.containerId);
-    s.writeUInt32(item.itemUID);
-    s.writeUInt32(item.quantity);
-    s.writeFloat(item.unk_f);
-    s.writeUInt32(item.unk_pad);
+    // Inventory
+    s.writeUInt32(save.inventory.length);
+    for (const item of save.inventory) {
+      s.writeWStr(item.itemId);
+      s.writeWStr(item.containerId);
+      s.writeUInt32(item.itemUID);
+      s.writeUInt32(item.quantity);
+      s.writeFloat(item.unk_f);
+      s.writeUInt32(item.unk_pad);
+    }
+  } else {
+    // Partial parse: the sentinel + wsCount + weapon/inventory data are all in rawTail
+    // (rawTail was reset to include weaponSectionStart onwards)
+    // We skip writing the sentinel/weapons/inventory blocks separately.
+    // They are all in rawTail which will be written below.
   }
 
   // Raw tail

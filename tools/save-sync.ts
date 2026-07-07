@@ -721,7 +721,7 @@ function inspectSave(filePath: string): void {
   // Import parser
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const {
-    parseSaveFile, maybeDecompress, CHARACTER_CLASS
+    parseSaveFile, maybeDecompress, CHARACTER_CLASS, CHARACTER_CLASS_BY_KEY
   } = require("../src/parser/save-file");
 
   console.log(`\n╔══════════════════════════════════════════════════════════╗`);
@@ -750,7 +750,11 @@ function inspectSave(filePath: string): void {
 
   const h = save.header;
   const loc = save.location;
-  const charName = CHARACTER_CLASS[loc.charClassId] ?? `Unknown(${loc.charClassId})`;
+  // Determine character name from charTypeKey string (most reliable)
+  const charFromKey = CHARACTER_CLASS_BY_KEY?.[loc.charTypeKey];
+  const charName = charFromKey !== undefined
+    ? CHARACTER_CLASS[charFromKey]
+    : (CHARACTER_CLASS[loc.charClassId] ?? `Unknown(${loc.charClassId})`);
 
   console.log(`\n┌─ PLAYER ──────────────────────────────────────────────────`);
   console.log(`│  Character : ${charName} (${loc.charTypeKey})`);
@@ -764,6 +768,11 @@ function inspectSave(filePath: string): void {
   console.log(`│  Checkpoint: ${loc.checkpoint}`);
   console.log(`│  Spawn     : ${loc.spawnPoint}`);
   console.log(`│  Chk2      : ${loc.checkpoint2}`);
+  if (save._parseError) {
+    console.log(`│  ⚠ Partial parse (${save._parseError.slice(0, 60)})`);
+    console.log(`│  This save uses a different format (prologue/early game).`);
+    console.log(`│  Basic edits (money, level, HP) still work.`);
+  }
   console.log(`├─ WEAPONS (quick slots: ${save.quickSlots.length}) ────────────────────────────`);
   for (let i = 0; i < save.quickSlots.length; i++) {
     const w = save.quickSlots[i];
