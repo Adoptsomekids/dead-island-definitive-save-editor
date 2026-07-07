@@ -93,6 +93,16 @@ export interface SkillEntry {
   unlocked: boolean;
 }
 
+/** Storage (chest/stash) item — same structure as WeaponItem but stored in rawTail */
+export interface StorageItem {
+  itemId: string;
+  craftplanId: string;
+  itemUID: number;
+  quantity: number;
+  durability: number;
+  itemLevel: number;
+}
+
 /** Complete parsed save file */
 export interface SaveFile {
   header: SaveHeader;
@@ -105,7 +115,9 @@ export interface SaveFile {
   /** 3 separator values between weapons and inventory section */
   _invSeparators: [number, number, number];
   inventory: InventoryItem[];
-  /** Raw tail bytes — everything after inventory until EOF (skills, quests, fog, etc.) */
+  /** Player storage/stash items (parsed from rawTail section 1) */
+  storage: StorageItem[];
+  /** Raw tail bytes — everything after the storage section until EOF */
   rawTail: Buffer;
   /** If set, the weapon/inventory section could not be fully parsed (e.g. prologue saves) */
   _parseError?: string;
@@ -372,15 +384,71 @@ export function parseSaveFile(decompressed: Buffer): SaveFile {
     s.position = weaponSectionStart;
   }
 
-  // ── Raw tail ─────────────────────────────────────────────────────────────
-  const rawTail = s.readToEnd();
+  // ── Raw tail — parse storage section first ───────────────────────────────
+  const tailBuf = s.readToEnd();
+  const storage: StorageItem[] = [];
+  let rawTail: Buffer = tailBuf;
+
+  // Only parse storage if the main weapon/inventory section was fully parsed (standard layout)
+  if (!parseError) {
+    try {
+      const ts = Stream.from(tailBuf);
+
+      // Storage section header: u32 separator (=1), u32 itemCount, u8 pad (=0)
+      const storSep   = ts.readUInt32();
+      const storCount = ts.readUInt32();
+      const storPad   = ts.readByte();
+
+      if (storSep === 1 && storCount > 0 && storCount < 100 && storPad === 0) {
+        for (let i = 0; i < storCount; i++) {
+          const itemId      = ts.readWStr();
+          const craftplanId = ts.readWStr();
+          const itemUID     = ts.readUInt32();
+          const quantity    = ts.readUInt32();
+          const durability  = ts.readFloat();
+          const itemLevel   = ts.readUInt32();
+
+          // Validate the read makes sense
+          const durOk = durability === -1.0 || (durability >= 0 && durability <= 100);
+          const qtyOk = quantity <= 99999;
+          const lvlOk = itemLevel <= 20;
+          if (!durOk || !qtyOk || !lvlOk) {
+            // Storage parse failed — just use full tailBuf as rawTail
+            storage.length = 0;
+            break;
+          }
+
+          storage.push({ itemId, craftplanId, itemUID, quantity, durability, itemLevel });
+
+          // Trailing 0x00 byte after each storage item
+          if (ts.position < ts.length && ts.getBuffer()[ts.position] === 0x00) {
+            ts.readByte();
+          }
+        }
+
+        // If storage parsed successfully, the remaining bytes are the actual rawTail
+        if (storage.length === storCount) {
+          rawTail = ts.readToEnd();
+        } else {
+          storage.length = 0;
+          rawTail = tailBuf;
+        }
+      }
+    } catch {
+      // Storage parse failed, keep full tailBuf as rawTail
+      storage.length = 0;
+      rawTail = tailBuf;
+    }
+  }
 
   return {
     header, location, quickSlotSentinel,
     heldWeapon: heldWeapon!,
     quickSlots,
     _invSeparators,
-    inventory, rawTail,
+    inventory,
+    storage,
+    rawTail,
     _parseError: parseError ?? undefined,
   };
 }
@@ -483,7 +551,23 @@ export function serializeSaveFile(save: SaveFile): Buffer {
     // They are all in rawTail which will be written below.
   }
 
-  // Raw tail
+  // Storage section (only written when main weapon/inv was fully parsed)
+  if (!save._parseError && save.storage && save.storage.length > 0) {
+    s.writeUInt32(1);                          // separator = 1
+    s.writeUInt32(save.storage.length);        // item count
+    s.writeByte(0);                            // pad = 0
+    for (const item of save.storage) {
+      s.writeWStr(item.itemId);
+      s.writeWStr(item.craftplanId);
+      s.writeUInt32(item.itemUID);
+      s.writeUInt32(item.quantity);
+      s.writeFloat(item.durability);
+      s.writeUInt32(item.itemLevel);
+      s.writeByte(0);                          // trailing 0x00 per item
+    }
+  }
+
+  // Raw tail (everything after storage: skills, quests, collectibles, map fog)
   s.writeBytes(save.rawTail);
 
   return s.getBuffer().slice(0, s.position);
@@ -554,3 +638,41 @@ export function maxAllInventory(save: SaveFile, maxQty = 999): SaveFile {
   const inventory = save.inventory.map(item => ({ ...item, quantity: maxQty }));
   return { ...save, inventory };
 }
+
+/** Set the quantity of a storage item */
+export function setStorageItemQty(save: SaveFile, itemId: string, quantity: number): SaveFile {
+  const storage = save.storage.map(item =>
+    item.itemId === itemId ? { ...item, quantity: quantity >>> 0 } : item
+  );
+  return { ...save, storage };
+}
+
+/** Max out durability on all storage weapons */
+export function maxStorageDurability(save: SaveFile): SaveFile {
+  const storage = save.storage.map(w => ({
+    ...w, durability: (w.durability < 0) ? w.durability : 100.0
+  }));
+  return { ...save, storage };
+}
+
+/** Add or update an item in the storage chest */
+export function setStorageItem(
+  save: SaveFile,
+  itemId: string,
+  craftplanId: string,
+  quantity: number,
+  durability: number,
+  itemLevel: number,
+  itemUID = 0
+): SaveFile {
+  const existing = save.storage.findIndex(it => it.itemId === itemId);
+  const newItem: StorageItem = { itemId, craftplanId, itemUID, quantity, durability, itemLevel };
+  if (existing >= 0) {
+    const storage = save.storage.map((it, i) => i === existing ? newItem : it);
+    return { ...save, storage };
+  }
+  return { ...save, storage: [...save.storage, newItem] };
+}
+
+// Re-export StorageItem for convenience
+export type { StorageItem };

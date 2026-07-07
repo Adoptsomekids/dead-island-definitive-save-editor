@@ -33,6 +33,8 @@ const {
   maxAllInventory,
   setInventoryItemQty,
   replaceQuickSlotWeapon,
+  maxStorageDurability,
+  setStorageItemQty,
   CHARACTER_CLASS,
   CHARACTER_CLASS_BY_KEY,
 } = require("../src/parser/save-file");
@@ -115,6 +117,13 @@ function parseSave(filePath: string): any {
       itemId:   it.itemId,
       quantity: it.quantity,
     })),
+    storage: (save.storage as any[]).map((it: any) => ({
+      itemId:      it.itemId,
+      craftplanId: it.craftplanId,
+      quantity:    it.quantity,
+      durability:  it.durability,
+      itemLevel:   it.itemLevel,
+    })),
     rawTailSize: save.rawTail?.length ?? 0,
   };
 }
@@ -154,6 +163,16 @@ function applyEdits(
     for (const { itemId, quantity } of edits.inventory) {
       save = setInventoryItemQty(save, itemId, parseInt(quantity, 10));
       changes.push(`${itemId} qty → ${quantity}`);
+    }
+  }
+  if (edits.maxStorageDurability) {
+    save = maxStorageDurability(save);
+    changes.push("all storage weapon durability → 100");
+  }
+  if (edits.storage && Array.isArray(edits.storage)) {
+    for (const { itemId, quantity } of edits.storage) {
+      save = setStorageItemQty(save, itemId, parseInt(quantity, 10));
+      changes.push(`storage:${itemId} qty → ${quantity}`);
     }
   }
   if (edits.weapons && Array.isArray(edits.weapons)) {
@@ -803,6 +822,32 @@ function renderEditor(save) {
     </div></div>\`;
   }
 
+  // ── Storage / Chest ──────────────────────────────────────────────────────────
+  if (!save.parseError && save.storage?.length > 0) {
+    html += \`<div class="panel">
+    <div class="panel-hdr">🎒 Storage Chest (\${save.storage.length} weapons)</div>
+    <div class="panel-body">
+      <div style="font-size:11px;color:var(--text2);margin-bottom:12px;">Items in the stash/chest shared between characters.</div>
+      \${save.storage.map((it, i) => {
+        const isAmmo = it.durability < 0;
+        return \`<div class="weapon-row" style="grid-template-columns:28px 1fr 90px 70px 70px;">
+          <div class="wep-slot" style="color:#aaa;">\${i}</div>
+          <div class="wep-info">
+            <div class="wep-id">\${it.itemId}</div>
+            <div class="wep-plan">\${it.craftplanId || ''}</div>
+          </div>
+          <div><div class="wep-lbl">Dur</div><input class="wep-input" id="stor-dur-\${i}" type="number" value="\${isAmmo ? -1 : Math.max(0,it.durability).toFixed(1)}" min="-1" max="100"\${isAmmo?' disabled style="opacity:0.4"':''}></div>
+          <div><div class="wep-lbl">Qty</div><input class="wep-input" id="stor-qty-\${i}" type="number" value="\${it.quantity}" min="0" max="9999"></div>
+          <div><div class="wep-lbl">Lvl</div><input class="wep-input" id="stor-lvl-\${i}" type="number" value="\${it.itemLevel}" min="0" max="10"></div>
+        </div>\`;
+      }).join('')}
+      <div class="btn-row">
+        <button class="btn btn-primary" onclick="applyStorageEdits()">💾 Apply Storage</button>
+        <button class="btn btn-secondary" onclick="maxStorageDurability()">🔧 Max All Durability</button>
+      </div>
+    </div></div>\`;
+  }
+
   // ── Download & Xbox Push ────────────────────────────────────────────────────
   html += \`<div class="panel">
     <div class="panel-hdr">📥 Download &amp; Push to Xbox</div>
@@ -875,6 +920,15 @@ async function applyInventoryEdits() {
 }
 
 async function maxAllDurability() { await sendEdits({ maxDurability: true }); }
+async function maxStorageDurability() { await sendEdits({ maxStorageDurability: true }); }
+async function applyStorageEdits() {
+  if (!currentSave?.storage) return;
+  const storage = currentSave.storage.map((it, i) => ({
+    itemId: it.itemId,
+    quantity: document.getElementById('stor-qty-' + i)?.value ?? it.quantity,
+  }));
+  await sendEdits({ storage });
+}
 async function maxAllAmmo() {
   // Set quantity on all firearm slots
   if (!currentSave?.quickSlots) return;
