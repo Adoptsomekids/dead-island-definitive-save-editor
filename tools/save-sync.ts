@@ -1396,21 +1396,40 @@ function cmdListSteam(): void {
 }
 
 // ── cs-push helpers ────────────────────────────────────────────────────────────
+//
+// Upload flow (xbcsmgr-verified 4-phase approach):
+//
+// Phase 1 — GetBlobUri:
+//   POST /connectedstorage/users/xuid({xuid})/scids/{scid}/atoms/{atomUuid}
+//   Body: {size: N}  → Returns { BlobUri: "https://...blob.core.windows.net/...?sv=...&sig=..." }
+//
+// Phase 2 — Upload blocks to Azure:
+//   PUT {BlobUri}?comp=block&blockId={base64BlockId}
+//   Body: raw binary chunk (up to 4 MB per block)
+//   No Xbox auth — SAS token embedded in BlobUri
+//
+// Phase 3 — CommitAtom:
+//   POST /connectedstorage/.../atoms/{atomUuid}?commit=true
+//   Body: { BlockIds: ["AAAAAA==", ...], Size: N }
+//
+// Phase 4 — UpdateBlob (savedgames reference):
+//   POST /connectedstorage/.../savedgames/{saveName}?clientFileTime=...&displayName={saveName}
+//   Body: { Atoms: [{ Name: "save_1.sav", Atom: "{atomUuid},binary" }] }
 
-/**
- * Request a writable SAS URL to upload a new atom to Xbox title storage.
- * Uses: POST /connectedstorage/users/xuid({xuid})/scids/{scid}/atoms
- * Body: { size: N }
- * Returns: { atomGuid: string; blobUri: string }
+/** Phase 1: Request a SAS upload URL for a new atom GUID from Xbox title storage.
+ *  Uses: POST /connectedstorage/users/xuid({xuid})/scids/{scid}/atoms/{atomUuid}
+ *  Body: {size: N}  → Returns { BlobUri: "https://...blob.core.windows.net/..." }
+ *  Per xbcsmgr: the atom GUID is generated client-side and passed IN THE URL PATH.
  */
 async function getAtomUploadUrl(
   fullHeader: string,
   xuid: string,
   scid: string,
+  atomUuid: string,
   size: number,
   pfn: string
-): Promise<{ atomGuid: string; blobUri: string }> {
-  const url = `${TS_ENDPOINT}/connectedstorage/users/xuid(${xuid})/scids/${scid}/atoms`;
+): Promise<string> {
+  const url = `${TS_ENDPOINT}/connectedstorage/users/xuid(${xuid})/scids/${scid}/atoms/${encodeURIComponent(atomUuid + ",binary")}`;
   const r = await httpsRequest(url, "POST",
     {
       "Authorization": fullHeader,
@@ -1419,26 +1438,32 @@ async function getAtomUploadUrl(
       "Accept": "application/json",
       "x-xbl-pfn": pfn,
     },
-    JSON.stringify({ size })
+    `{size: ${size}}`   // xbcsmgr uses non-standard JSON (no quotes around key)
   );
   if (r.status !== 200 && r.status !== 201) {
-    throw new Error(`atoms POST (upload) failed ${r.status}: ${r.body.slice(0, 300)}`);
+    throw new Error(`GetBlobUri failed ${r.status}: ${r.body.slice(0, 400)}`);
   }
   const body = JSON.parse(r.body);
-  const atomGuid = body.atomGuid ?? body.atom ?? body.id;
-  const blobUri  = body.blobUri ?? body.uploadUri;
-  if (!blobUri)  throw new Error(`No blobUri in upload response: ${r.body.slice(0, 200)}`);
-  if (!atomGuid) throw new Error(`No atomGuid in upload response: ${r.body.slice(0, 200)}`);
-  return { atomGuid, blobUri };
+  const blobUri = body.BlobUri ?? body.blobUri ?? body.uploadUri;
+  if (!blobUri) throw new Error(`No BlobUri in response: ${r.body.slice(0, 200)}`);
+  return blobUri;
 }
 
-/**
- * Upload binary bytes to an Azure Blob Storage SAS URL via PUT.
+/** Phase 2: Upload a block to Azure Blob Storage via SAS URL.
+ *  PUT {blobUri}?comp=block&blockId={base64BlockId}
+ *  No Xbox auth headers — authenticated by the SAS token in the URL.
  */
-function uploadToSasUrl(sasUrl: string, data: Buffer): Promise<void> {
+function uploadBlockToSasUrl(
+  sasUrl: string,
+  blockId: string,
+  data: Buffer
+): Promise<void> {
   return new Promise((resolve, reject) => {
-    const urlObj = new URL(sasUrl);
-    const lib    = urlObj.protocol === "https:" ? require("https") : require("http");
+    const urlObj  = new URL(sasUrl);
+    // Append block-level query params
+    urlObj.searchParams.set("comp", "block");
+    urlObj.searchParams.set("blockid", blockId);
+    const lib = urlObj.protocol === "https:" ? require("https") : require("http");
     const req = lib.request(
       {
         hostname: urlObj.hostname,
@@ -1457,7 +1482,7 @@ function uploadToSasUrl(sasUrl: string, data: Buffer): Promise<void> {
           if (res.statusCode >= 200 && res.statusCode < 300) {
             resolve();
           } else {
-            reject(new Error(`SAS PUT failed ${res.statusCode}: ${Buffer.concat(chunks).toString().slice(0, 200)}`));
+            reject(new Error(`Azure block PUT failed ${res.statusCode}: ${Buffer.concat(chunks).toString().slice(0, 200)}`));
           }
         });
       }
@@ -1468,24 +1493,22 @@ function uploadToSasUrl(sasUrl: string, data: Buffer): Promise<void> {
   });
 }
 
-/**
- * Commit an updated savedgame manifest to Xbox title storage.
- * Uses: PUT /connectedstorage/users/xuid({xuid})/scids/{scid}/savedgames/{saveName}
- * Body: { atoms: [ { name: atomName, atom: atomGuid, size: N } ] }
+/** Phase 3: Commit the uploaded blocks as a single atom on Xbox title storage.
+ *  POST /connectedstorage/.../atoms/{atomUuid}?commit=true
+ *  Body: { BlockIds: [...base64 block IDs], Size: N }
  */
-async function commitSavedGame(
+async function commitAtom(
   fullHeader: string,
   xuid: string,
   scid: string,
-  saveName: string,
-  atomName: string,
-  atomGuid: string,
+  atomUuid: string,
+  blockIds: string[],
   size: number,
   pfn: string
 ): Promise<void> {
-  const url  = `${TS_ENDPOINT}/connectedstorage/users/xuid(${xuid})/scids/${scid}/savedgames/${encodeURIComponent(saveName)}`;
-  const body = JSON.stringify({ atoms: [{ name: atomName, atom: atomGuid, size }] });
-  const r    = await httpsRequest(url, "PUT",
+  const url  = `${TS_ENDPOINT}/connectedstorage/users/xuid(${xuid})/scids/${scid}/atoms/${encodeURIComponent(atomUuid + ",binary")}?commit=true`;
+  const body = JSON.stringify({ BlockIds: blockIds, Size: size });
+  const r    = await httpsRequest(url, "POST",
     {
       "Authorization": fullHeader,
       "x-xbl-contract-version": "107",
@@ -1495,9 +1518,84 @@ async function commitSavedGame(
     },
     body
   );
-  if (r.status !== 200 && r.status !== 204) {
-    throw new Error(`savedgames PUT failed ${r.status}: ${r.body.slice(0, 300)}`);
+  if (r.status !== 200 && r.status !== 201 && r.status !== 204) {
+    throw new Error(`CommitAtom failed ${r.status}: ${r.body.slice(0, 300)}`);
   }
+}
+
+/** Phase 4: Update the savedgame manifest to point to the new atom.
+ *  POST /connectedstorage/.../savedgames/{saveName}?clientFileTime=...&displayName={saveName}
+ *  Body: { Atoms: [{ Name: "save_1.sav", Atom: "{atomUuid},binary" }] }
+ *  Per xbcsmgr: uses POST (not PUT), clientFileTime in ISO format, displayName = slot name.
+ */
+async function updateSavedGame(
+  fullHeader: string,
+  xuid: string,
+  scid: string,
+  saveName: string,      // e.g. "save_1.sav"
+  atomName: string,      // e.g. "save_1.sav" (same as saveName usually)
+  atomUuid: string,      // new atom GUID
+  pfn: string
+): Promise<void> {
+  const clientFileTime = new Date().toISOString().replace(/(\.\d{3})Z$/, ".0000000+00:00");
+  const url  = `${TS_ENDPOINT}/connectedstorage/users/xuid(${xuid})/scids/${scid}/savedgames/${encodeURIComponent(saveName)}?clientFileTime=${encodeURIComponent(clientFileTime)}&displayName=${encodeURIComponent(saveName)}`;
+  const body = JSON.stringify({ Atoms: [{ Name: atomName, Atom: atomUuid + ",binary" }] });
+  const r    = await httpsRequest(url, "POST",
+    {
+      "Authorization": fullHeader,
+      "x-xbl-contract-version": "107",
+      "Content-Type": "application/json",
+      "Accept": "application/json",
+      "x-xbl-pfn": pfn,
+    },
+    body
+  );
+  if (r.status !== 200 && r.status !== 201 && r.status !== 204) {
+    throw new Error(`UpdateSavedGame failed ${r.status}: ${r.body.slice(0, 300)}`);
+  }
+}
+
+/** Full upload pipeline: GetBlobUri → uploadBlocks → commitAtom → updateSavedGame */
+async function uploadAtom(
+  fullHeader: string,
+  xuid: string,
+  scid: string,
+  saveName: string,
+  atomName: string,
+  data: Buffer,
+  pfn: string
+): Promise<string> {
+  const newAtomUuid  = crypto.randomUUID().toUpperCase();
+  const BLOCK_SIZE   = 4 * 1024 * 1024; // 4 MB max per block
+
+  // Phase 1: get SAS URL
+  process.stdout.write(`  Phase 1/4 — Requesting upload slot (atom ${newAtomUuid.slice(0,8)}...)... `);
+  const blobUri = await getAtomUploadUrl(fullHeader, xuid, scid, newAtomUuid, data.length, pfn);
+  console.log(`✔  SAS URL received`);
+
+  // Phase 2: upload blocks
+  const blockIds: string[] = [];
+  const totalBlocks = Math.ceil(data.length / BLOCK_SIZE);
+  for (let i = 0; i < totalBlocks; i++) {
+    const chunk   = data.slice(i * BLOCK_SIZE, Math.min((i + 1) * BLOCK_SIZE, data.length));
+    const blockId = Buffer.from(String(i).padStart(6, "0")).toString("base64");
+    blockIds.push(blockId);
+    process.stdout.write(`  Phase 2/4 — Uploading block ${i + 1}/${totalBlocks} (${chunk.length.toLocaleString()} bytes)... `);
+    await uploadBlockToSasUrl(blobUri, blockId, chunk);
+    console.log(`✔`);
+  }
+
+  // Phase 3: commit atom
+  process.stdout.write(`  Phase 3/4 — Committing atom... `);
+  await commitAtom(fullHeader, xuid, scid, newAtomUuid, blockIds, data.length, pfn);
+  console.log(`✔`);
+
+  // Phase 4: update savedgame reference
+  process.stdout.write(`  Phase 4/4 — Updating savedgame manifest... `);
+  await updateSavedGame(fullHeader, xuid, scid, saveName, atomName, newAtomUuid, pfn);
+  console.log(`✔`);
+
+  return newAtomUuid;
 }
 
 // ── --cs-push ─────────────────────────────────────────────────────────────────
@@ -1625,28 +1723,16 @@ async function cmdCsPush(): Promise<void> {
 
   console.log(`✔ Authenticated as: ${gamertag} (XUID: ${xuid})`);
 
-  // ── Step 4: Get upload SAS URL for new atom ──────────────────────────────────
-  console.log(`\nRequesting upload slot for new atom...`);
-  const { atomGuid: newAtomGuid, blobUri } = await getAtomUploadUrl(
-    fullHeader, xuid, scid, uploadBytes.length, pfn
+  // ── Steps 4-7: Upload via 4-phase pipeline ───────────────────────────────────
+  console.log(`\nUploading ${uploadBytes.length.toLocaleString()} bytes via 4-phase pipeline...`);
+  const newAtomGuid = await uploadAtom(
+    fullHeader, xuid, scid, saveName, atomName, uploadBytes, pfn
   );
-  console.log(`✔ New atom GUID: ${newAtomGuid}`);
-  console.log(`  Upload URL:    ${blobUri.slice(0, 60)}...`);
 
-  // ── Step 5: Upload bytes to Azure Blob SAS URL ───────────────────────────────
-  process.stdout.write(`\nUploading ${uploadBytes.length.toLocaleString()} bytes to Azure Blob... `);
-  await uploadToSasUrl(blobUri, uploadBytes);
-  console.log(`✔`);
-
-  // ── Step 6: Commit the savedgame manifest ────────────────────────────────────
-  process.stdout.write(`Committing savedgame "${saveName}" → atom "${newAtomGuid}"... `);
-  await commitSavedGame(fullHeader, xuid, scid, saveName, atomName, newAtomGuid, uploadBytes.length, pfn);
-  console.log(`✔`);
-
-  // ── Step 7: Update local manifest ────────────────────────────────────────────
+  // ── Update local manifest ────────────────────────────────────────────────────
   const updatedManifest = { atoms: [{ name: atomName, atom: newAtomGuid, size: uploadBytes.length }] };
   fs.writeFileSync(manifestPath, JSON.stringify(updatedManifest, null, 2));
-  console.log(`\nUpdated manifest: ${manifestPath}`);
+  console.log(`\n  Updated local manifest: ${manifestPath}`);
 
   console.log(`
 ╔══════════════════════════════════════════════════════════════╗

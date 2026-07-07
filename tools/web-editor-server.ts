@@ -17,7 +17,7 @@
 import * as http from "http";
 import * as fs from "fs";
 import * as path from "path";
-import * as url from "url";
+// url module no longer needed — using WHATWG URL global
 import * as zlib from "zlib";
 import * as https from "https";
 
@@ -267,7 +267,7 @@ function parseMultipart(
 
 // ── HTTP server ───────────────────────────────────────────────────────────────
 const server = http.createServer((req, res) => {
-  const parsedUrl = url.parse(req.url ?? "/", true);
+  const parsedUrl = new URL(req.url ?? "/", "http://localhost");
   const pathname  = parsedUrl.pathname ?? "/";
 
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -284,7 +284,7 @@ const server = http.createServer((req, res) => {
 
   // ── GET /api/parse ─────────────────────────────────────────────────────────
   if (pathname === "/api/parse" && req.method === "GET") {
-    const fname = parsedUrl.query.file as string;
+    const fname = parsedUrl.searchParams.get("file") ?? "";
     const full  = path.join(SAVES, path.basename(fname));
     if (!fs.existsSync(full)) {
       res.writeHead(404, { "Content-Type": "application/json" });
@@ -325,7 +325,7 @@ const server = http.createServer((req, res) => {
 
   // ── GET /api/download ──────────────────────────────────────────────────────
   if (pathname === "/api/download" && req.method === "GET") {
-    const fname = parsedUrl.query.file as string;
+    const fname = parsedUrl.searchParams.get("file") ?? "";
     const full  = path.join(SAVES, path.basename(fname));
     if (!fs.existsSync(full)) {
       res.writeHead(404); res.end("Not found"); return;
@@ -893,7 +893,7 @@ function renderEditor(save) {
 
   // ── Collectibles + Skills + Fog ──────────────────────────────────────────────
   if (!save.parseError) {
-    const collUnlocked = (save.collectibles || []).filter((v: boolean) => v).length;
+    const collUnlocked = (save.collectibles || []).filter(v => !!v).length;
     const collTotal    = (save.collectibles || []).length;
     html += \`<div class="panel">
     <div class="panel-hdr">🏆 Collectibles, Skills &amp; Map</div>
