@@ -1429,7 +1429,8 @@ async function getAtomUploadUrl(
   size: number,
   pfn: string
 ): Promise<string> {
-  const url = `${TS_ENDPOINT}/connectedstorage/users/xuid(${xuid})/scids/${scid}/atoms/${encodeURIComponent(atomUuid + ",binary")}`;
+  // ★ Per xbcsmgr TitleStorageService.GetBlobUri: URL uses plain UUID (no ",binary" suffix)
+  const url = `${TS_ENDPOINT}/connectedstorage/users/xuid(${xuid})/scids/${scid}/atoms/${encodeURIComponent(atomUuid)}`;
   const r = await httpsRequest(url, "POST",
     {
       "Authorization": fullHeader,
@@ -1450,8 +1451,9 @@ async function getAtomUploadUrl(
 }
 
 /** Phase 2: Upload a block to Azure Blob Storage via SAS URL.
- *  PUT {blobUri}?comp=block&blockId={base64BlockId}
- *  No Xbox auth headers — authenticated by the SAS token in the URL.
+ *  ★ Per xbcsmgr UploadBlobAsync: blockId is BitConverter.GetBytes(int) → base64 (4-byte LE int)
+ *  The blockId is PREPENDED into the SAS URL before the '?' query separator.
+ *  No Xbox auth headers — authenticated by SAS token embedded in the URL.
  */
 function uploadBlockToSasUrl(
   sasUrl: string,
@@ -1459,10 +1461,12 @@ function uploadBlockToSasUrl(
   data: Buffer
 ): Promise<void> {
   return new Promise((resolve, reject) => {
-    const urlObj  = new URL(sasUrl);
-    // Append block-level query params
-    urlObj.searchParams.set("comp", "block");
-    urlObj.searchParams.set("blockid", blockId);
+    // ★ Per xbcsmgr: insert "comp=block&blockId={id}&" right after the '?'
+    const qIdx = sasUrl.indexOf("?");
+    const blockUrl = qIdx === -1
+      ? sasUrl + `?comp=block&blockId=${encodeURIComponent(blockId)}`
+      : sasUrl.slice(0, qIdx + 1) + `comp=block&blockId=${encodeURIComponent(blockId)}&` + sasUrl.slice(qIdx + 1);
+    const urlObj = new URL(blockUrl);
     const lib = urlObj.protocol === "https:" ? require("https") : require("http");
     const req = lib.request(
       {
@@ -1472,6 +1476,7 @@ function uploadBlockToSasUrl(
         headers: {
           "Content-Length": data.length,
           "Content-Type":   "application/octet-stream",
+          "Connection":     "Keep-Alive",
           "x-ms-blob-type": "BlockBlob",
         },
       },
@@ -1494,7 +1499,7 @@ function uploadBlockToSasUrl(
 }
 
 /** Phase 3: Commit the uploaded blocks as a single atom on Xbox title storage.
- *  POST /connectedstorage/.../atoms/{atomUuid}?commit=true
+ *  ★ Per xbcsmgr CommitAtom: URL uses plain UUID (no ",binary" suffix)
  *  Body: { BlockIds: [...base64 block IDs], Size: N }
  */
 async function commitAtom(
@@ -1506,7 +1511,8 @@ async function commitAtom(
   size: number,
   pfn: string
 ): Promise<void> {
-  const url  = `${TS_ENDPOINT}/connectedstorage/users/xuid(${xuid})/scids/${scid}/atoms/${encodeURIComponent(atomUuid + ",binary")}?commit=true`;
+  // ★ Plain UUID, no ",binary" in the URL path
+  const url  = `${TS_ENDPOINT}/connectedstorage/users/xuid(${xuid})/scids/${scid}/atoms/${encodeURIComponent(atomUuid)}?commit=true`;
   const body = JSON.stringify({ BlockIds: blockIds, Size: size });
   const r    = await httpsRequest(url, "POST",
     {
@@ -1574,11 +1580,16 @@ async function uploadAtom(
   console.log(`✔  SAS URL received`);
 
   // Phase 2: upload blocks
+  // ★ Per xbcsmgr: blockId = Convert.ToBase64String(BitConverter.GetBytes(blockId))
+  //   = 4-byte little-endian int → base64
   const blockIds: string[] = [];
   const totalBlocks = Math.ceil(data.length / BLOCK_SIZE);
   for (let i = 0; i < totalBlocks; i++) {
     const chunk   = data.slice(i * BLOCK_SIZE, Math.min((i + 1) * BLOCK_SIZE, data.length));
-    const blockId = Buffer.from(String(i).padStart(6, "0")).toString("base64");
+    // 4-byte LE int → base64 (matches C# BitConverter.GetBytes(int))
+    const idBuf   = Buffer.allocUnsafe(4);
+    idBuf.writeInt32LE(i, 0);
+    const blockId = idBuf.toString("base64");
     blockIds.push(blockId);
     process.stdout.write(`  Phase 2/4 — Uploading block ${i + 1}/${totalBlocks} (${chunk.length.toLocaleString()} bytes)... `);
     await uploadBlockToSasUrl(blobUri, blockId, chunk);
