@@ -6,17 +6,20 @@
 //   npx ts-node tools/web-editor-server.ts [--port=3000] [--saves=./saves]
 //
 // Endpoints:
-//   GET  /              → HTML UI
-//   GET  /api/saves     → list of editable save files (JSON)
-//   GET  /api/parse?file=X → parse a save file (JSON)
-//   POST /api/edit      → apply edits, write *_edited.bin (JSON)
-//   GET  /api/download?file=X → binary download of a save file
-//   POST /api/upload    → upload a new save file (multipart/form-data)
+//   GET  /                     → HTML UI
+//   GET  /api/saves            → list of editable save files (JSON)
+//   GET  /api/parse?file=X     → parse a save file (JSON)
+//   POST /api/edit             → apply edits, write *_edited.bin (JSON)
+//   GET  /api/download?file=X  → binary download of a save file
+//   POST /api/upload           → upload a new save file (multipart/form-data)
+//   POST /api/push-xbox        → push edited file back to Xbox Live (dry-run or real)
 
 import * as http from "http";
 import * as fs from "fs";
 import * as path from "path";
 import * as url from "url";
+import * as zlib from "zlib";
+import * as https from "https";
 
 const {
   parseSaveFile,
@@ -308,6 +311,67 @@ const server = http.createServer((req, res) => {
         res.end(JSON.stringify({ error: e.message }));
       }
     });
+    return;
+  }
+
+  // ── POST /api/push-xbox ────────────────────────────────────────────────────
+  // Spawns save-sync.ts --cs-push as a child process (reuses all auth logic)
+  if (pathname === "/api/push-xbox" && req.method === "POST") {
+    let body = "";
+    req.on("data", chunk => body += chunk);
+    req.on("end", () => {
+      try {
+        const { file, manifest, dryRun } = JSON.parse(body);
+        const full     = path.join(SAVES, path.basename(file));
+        const tsNode   = path.join(__dirname, "../node_modules/.bin/ts-node");
+        const syncTool = path.join(__dirname, "./save-sync.ts");
+
+        if (!fs.existsSync(full)) {
+          res.writeHead(404, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "File not found" })); return;
+        }
+
+        const args: string[] = [
+          "--transpile-only", syncTool,
+          "--cs-push", "--input", full,
+        ];
+        if (manifest) {
+          const mfull = path.join(SAVES, path.basename(manifest));
+          args.push("--manifest", mfull);
+        }
+        if (dryRun) args.push("--dry-run");
+
+        const { spawn } = require("child_process");
+        const child = spawn(tsNode, args, { cwd: path.join(__dirname, "..") });
+        let stdout = "";
+        let stderr = "";
+        child.stdout.on("data", (d: Buffer) => { stdout += d.toString(); });
+        child.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
+        child.on("close", (code: number) => {
+          if (code === 0) {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ success: true, output: stdout }));
+          } else {
+            res.writeHead(500, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ success: false, error: stderr || stdout }));
+          }
+        });
+      } catch (e: any) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+    return;
+  }
+
+  // ── GET /api/manifests ─────────────────────────────────────────────────────
+  if (pathname === "/api/manifests" && req.method === "GET") {
+    if (!fs.existsSync(SAVES)) { res.writeHead(200, { "Content-Type": "application/json" }); res.end("[]"); return; }
+    const manifests = fs.readdirSync(SAVES)
+      .filter(f => f.endsWith("_manifest.json"))
+      .map(f => ({ name: f }));
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(manifests));
     return;
   }
 
@@ -739,14 +803,43 @@ function renderEditor(save) {
     </div></div>\`;
   }
 
-  // ── Download edited file ────────────────────────────────────────────────────
+  // ── Download & Xbox Push ────────────────────────────────────────────────────
   html += \`<div class="panel">
-    <div class="panel-hdr">📥 Download</div>
-    <div class="panel-body" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
-      <button class="btn btn-success" onclick="downloadFile(currentFile)">⬇️ Download Current File</button>
-      <span style="font-size:11px;color:var(--text3)">Transfer to Xbox via Xbox app (PC) or usb</span>
+    <div class="panel-hdr">📥 Download &amp; Push to Xbox</div>
+    <div class="panel-body">
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:14px;">
+        <button class="btn btn-success" onclick="downloadFile(currentFile)">⬇️ Download .bin</button>
+        <span style="font-size:11px;color:var(--text3)">Save the file to transfer manually via USB or Xbox app (PC)</span>
+      </div>
+      <div style="border-top:1px solid var(--border);padding-top:14px;">
+        <div style="font-size:11px;font-weight:700;color:var(--text3);text-transform:uppercase;letter-spacing:0.08em;margin-bottom:10px;">📡 Push Directly to Xbox Live</div>
+        <div style="font-size:11px;color:var(--text2);margin-bottom:10px;line-height:1.6;">
+          Requires <code>--login-legacy</code> to be run first in the terminal.
+          Pushes the current file to Xbox Connected Storage so it's available next time you launch the game.
+        </div>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+          <select id="manifest-select" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:6px 10px;color:var(--text);font-size:12px;">
+            <option value="">Auto-detect manifest</option>
+          </select>
+          <button class="btn btn-warn" onclick="pushToXbox(true)">🔍 Dry Run</button>
+          <button class="btn btn-primary" onclick="pushToXbox(false)" style="background:#8b0000;">📡 Push to Xbox Live</button>
+        </div>
+        <div id="push-output" style="margin-top:10px;display:none;background:#0a0a0f;border:1px solid var(--border);border-radius:6px;padding:10px;font-size:11px;color:#aaa;font-family:monospace;white-space:pre-wrap;max-height:200px;overflow-y:auto;"></div>
+      </div>
     </div>
   </div>\`;
+
+  // Load manifests into the select
+  fetch('/api/manifests').then(r=>r.json()).then(mf => {
+    const sel = document.getElementById('manifest-select');
+    if (!sel) return;
+    mf.forEach(m => {
+      const opt = document.createElement('option');
+      opt.value = m.name;
+      opt.textContent = m.name;
+      sel.appendChild(opt);
+    });
+  });
 
   document.getElementById('main').innerHTML = html;
 }
@@ -838,6 +931,36 @@ function downloadFile(fname) {
   a.href = '/api/download?file=' + encodeURIComponent(fname);
   a.download = fname;
   a.click();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+async function pushToXbox(dryRun) {
+  if (!currentFile) { showToast('No file selected', true); return; }
+  const manifestSel = document.getElementById('manifest-select');
+  const manifest    = manifestSel?.value || null;
+  const outputEl    = document.getElementById('push-output');
+
+  showToast(dryRun ? '🔍 Running dry run…' : '📡 Pushing to Xbox Live…', false, true);
+  if (outputEl) { outputEl.style.display = 'block'; outputEl.textContent = '…'; }
+
+  try {
+    const res    = await fetch('/api/push-xbox', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ file: currentFile, manifest, dryRun }),
+    });
+    const result = await res.json();
+    if (result.success) {
+      showToast(dryRun ? '✔ Dry run OK — check output below' : '✔ Pushed to Xbox Live!');
+      if (outputEl) outputEl.textContent = result.output;
+    } else {
+      showToast((result.error ?? 'Push failed').slice(0, 120), true);
+      if (outputEl) outputEl.textContent = result.error ?? result.output ?? 'Unknown error';
+    }
+  } catch (e) {
+    showToast(e.message, true);
+    if (outputEl) outputEl.textContent = e.message;
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
