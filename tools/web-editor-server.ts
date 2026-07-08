@@ -490,6 +490,34 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // ── GET /api/items ─────────────────────────────────────────────────────────
+  if (pathname === "/api/items" && req.method === "GET") {
+    try {
+      const itemsFile = path.join(__dirname, "../src/data/items/items.json");
+      const data = fs.existsSync(itemsFile) ? JSON.parse(fs.readFileSync(itemsFile, "utf8")) : {};
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(data));
+    } catch (e: any) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // ── GET /api/collectibles-meta ─────────────────────────────────────────────
+  if (pathname === "/api/collectibles-meta" && req.method === "GET") {
+    try {
+      const cFile = path.join(__dirname, "../src/data/items/collectibles.json");
+      const data = fs.existsSync(cFile) ? JSON.parse(fs.readFileSync(cFile, "utf8")) : {};
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(data));
+    } catch (e: any) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
   // ── GET /api/manifests ─────────────────────────────────────────────────────
   if (pathname === "/api/manifests" && req.method === "GET") {
     if (!fs.existsSync(SAVES)) { res.writeHead(200, { "Content-Type": "application/json" }); res.end("[]"); return; }
@@ -990,13 +1018,24 @@ function renderEditor(save) {
     <div class="panel-body">
       <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px;margin-bottom:16px;">
 
-        <div style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:14px;">
-          <div style="font-size:12px;font-weight:700;color:var(--text2);margin-bottom:10px;text-transform:uppercase;letter-spacing:0.08em;">🃏 Collectibles</div>
-          <div style="font-size:28px;font-weight:700;color:\${collUnlocked===collTotal?'#4ade80':'#f0a500'};">\${collUnlocked}<span style="font-size:14px;color:var(--text3)"> / \${collTotal}</span></div>
-          <div style="font-size:11px;color:var(--text3);margin-bottom:12px;">ID cards · Newspapers · Tapes</div>
-          <div style="display:flex;gap:8px;flex-wrap:wrap;">
-            <button class="btn btn-primary" style="font-size:11px;padding:5px 10px;" onclick="unlockAllCollectibles()">🔓 Unlock All</button>
-            <button class="btn btn-secondary" style="font-size:11px;padding:5px 10px;" onclick="lockAllCollectibles()">🔒 Lock All</button>
+        <div style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:14px;grid-column:1/-1;">
+          <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-bottom:12px;">
+            <div>
+              <div style="font-size:12px;font-weight:700;color:var(--text2);text-transform:uppercase;letter-spacing:0.08em;margin-bottom:4px;">🃏 Collectibles</div>
+              <div style="font-size:24px;font-weight:700;color:\${collUnlocked===collTotal?'#4ade80':'#f0a500'};">\${collUnlocked}<span style="font-size:14px;color:var(--text3)"> / \${collTotal}</span></div>
+              <div style="font-size:11px;color:var(--text3);margin-top:3px;">ID cards · Newspapers · Audio tapes</div>
+            </div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;">
+              <button class="btn btn-primary" style="font-size:11px;padding:5px 10px;" onclick="unlockAllCollectibles()">🔓 Unlock All</button>
+              <button class="btn btn-secondary" style="font-size:11px;padding:5px 10px;" onclick="lockAllCollectibles()">🔒 Lock All</button>
+            </div>
+          </div>
+          <div id="coll-list" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:5px;max-height:220px;overflow-y:auto;">
+            \${(save.collectibles||[]).map((v,i)=>\`
+              <div style="display:flex;align-items:center;gap:6px;background:\${v?'rgba(39,174,96,0.08)':'rgba(0,0,0,0.2)'};border:1px solid \${v?'#27ae60':'var(--border)'};border-radius:5px;padding:5px 8px;font-size:10px;">
+                <span style="color:\${v?'#4ade80':'#555'};font-size:12px;">\${v?'✔':'○'}</span>
+                <span style="color:\${v?'var(--text)':'var(--text3)'};flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" id="coll-name-\${i}">#\${i+1}</span>
+              </div>\`).join('')}
           </div>
         </div>
 
@@ -1141,6 +1180,15 @@ function renderEditor(save) {
   });
 
   document.getElementById('main').innerHTML = html;
+
+  // Asynchronously hydrate collectible names from /api/collectibles-meta
+  fetch('/api/collectibles-meta').then(r => r.json()).then(meta => {
+    if (!meta.collectibles) return;
+    for (const c of meta.collectibles) {
+      const el = document.getElementById('coll-name-' + c.index);
+      if (el) el.textContent = c.label;
+    }
+  }).catch(() => {});
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
