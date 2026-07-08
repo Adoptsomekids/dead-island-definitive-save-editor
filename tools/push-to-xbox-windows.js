@@ -223,8 +223,8 @@ if ($out.Count -eq 0) {
       let blob = "";
       if (hexStr.length > 0) {
         const buf = Buffer.from(hexStr, "hex");
-        // Token blobs are always UTF-16LE (Windows native wchar_t strings)
-        blob = buf.toString("utf16le");
+        // Token blobs are UTF-8 JSON strings (Gaming Services stores them as UTF-8, not UTF-16LE)
+        blob = buf.toString("utf8");
       }
       if (DEBUG && blob) {
         const preview = blob.slice(0, 80).replace(/\0/g, "");
