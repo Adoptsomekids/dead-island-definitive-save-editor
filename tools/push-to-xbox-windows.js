@@ -323,7 +323,7 @@ async function uploadAtom(fullHeader, xuid, data, saveName, atomName) {
   const p1 = await httpsReq(p1url, "POST", {
     "Authorization": fullHeader, "x-xbl-contract-version": "107",
     "Content-Type": "application/json", "Accept": "application/json", "x-xbl-pfn": PFN,
-  }, `{size: ${data.length}}`);
+  }, JSON.stringify({ size: data.length }));
   if (p1.status !== 200 && p1.status !== 201) {
     throw new Error(`GetBlobUri failed ${p1.status}: ${p1.body.slice(0, 400)}`);
   }
@@ -399,12 +399,13 @@ async function cmdListSaves() {
     "Authorization": fullHeader, "x-xbl-contract-version": "107", "x-xbl-pfn": PFN,
   });
   if (r.status !== 200) throw new Error(`List saves failed ${r.status}: ${r.body.slice(0, 200)}`);
-  const blobs = JSON.parse(r.body).blobs ?? [];
+  const parsed = JSON.parse(r.body);
+  const blobs  = parsed.blobs ?? parsed.savedgames ?? parsed.items ?? [];
   console.log(`\n  Found ${blobs.length} save slot(s):\n`);
   for (const b of blobs) {
     const sz = b.size ? `${(b.size / 1024).toFixed(1)} KB` : "?";
     const dt = b.clientFileTime ? `  [${b.clientFileTime.slice(0, 10)}]` : "";
-    console.log(`    ${b.fileName ?? b.displayName ?? "(unnamed)"}  ${sz}${dt}`);
+    console.log(`    ${b.fileName ?? b.displayName ?? b.name ?? "(unnamed)"}  ${sz}${dt}`);
   }
   console.log();
 }
