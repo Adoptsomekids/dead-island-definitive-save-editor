@@ -55,7 +55,22 @@ const INPUT      = getArg("--input");
 const MANIFEST   = getArg("--manifest");
 const DRY_RUN    = hasFlag("--dry-run");
 const LIST_SAVES = hasFlag("--list-saves");
+const LOGIN      = hasFlag("--login");
 const DEBUG      = hasFlag("--debug") || !!process.env.DEBUG;
+
+// Token cache (same file as save-sync.ts --login)
+const CACHE_FILE = path.join(os.homedir(), ".xbox-savebridge-tokens.json");
+const MSA_CLIENT_ID = "b1eab458-325b-45a5-9692-ad6079c1eca8";
+const MSA_TENANT    = "consumers";
+const MSA_SCOPES    = "Xboxlive.signin Xboxlive.offline_access offline_access";
+const XSTS_ENDPOINT = "https://xsts.auth.xboxlive.com/xsts/authorize";
+const XASU_ENDPOINT = "https://user.auth.xboxlive.com/user/authenticate";
+
+function loadCache() {
+  try { if (fs.existsSync(CACHE_FILE)) return JSON.parse(fs.readFileSync(CACHE_FILE, "utf8")); } catch {}
+  return {};
+}
+function saveTokenCache(c) { fs.writeFileSync(CACHE_FILE, JSON.stringify(c, null, 2), { mode: 0o600 }); }
 
 // ── HTTP helper ────────────────────────────────────────────────────────────────
 function httpsReq(url, method, headers, body) {
@@ -602,7 +617,8 @@ async function uploadAtom(fullHeader, xuid, data, saveName, atomName) {
 async function cmdListSaves() {
   console.log("\n  Dead Island DE — List Saves from Xbox Live");
   console.log("  " + "─".repeat(42));
-  const { fullHeader, xuid } = await authenticateFromWincred();
+  console.log("  Authenticating...");
+  const { fullHeader, xuid } = await authenticate();
   const url = `${TS}/connectedstorage/users/xuid(${xuid})/scids/${SCID}?maxItems=50`;
   const r   = await httpsReq(url, "GET", {
     "Authorization": fullHeader, "x-xbl-contract-version": "107", "x-xbl-pfn": PFN,
@@ -634,6 +650,7 @@ Options:
   --input <file>        Edited save file (.bin) to push
   --manifest <file>     Manifest JSON (auto-detected if omitted)
   --dry-run             Show what would be uploaded, don't actually push
+  --login               Xbox Live login (one-time, browser device-code flow)
   --list-saves          List your current saves from Xbox Live
   --debug               Show verbose debug output
 `);
@@ -701,7 +718,7 @@ Options:
 
   // Authenticate
   console.log("\n  Authenticating...");
-  const { fullHeader, xuid } = await authenticateFromWincred();
+  const { fullHeader, xuid } = await authenticate();
 
   // Upload
   console.log("\n  Uploading via 4-phase pipeline...");
@@ -728,8 +745,235 @@ Options:
 `);
 }
 
+// ── MSA device-code login (same flow as save-sync.ts --login) ─────────────────
+async function msaDeviceCodeLogin() {
+  const r1 = await httpsReq(
+    `https://login.microsoftonline.com/${MSA_TENANT}/oauth2/v2.0/devicecode`,
+    "POST",
+    { "Content-Type": "application/x-www-form-urlencoded" },
+    new URLSearchParams({ client_id: MSA_CLIENT_ID, scope: MSA_SCOPES }).toString()
+  );
+  if (r1.status !== 200) throw new Error(`Device code request failed ${r1.status}: ${r1.body.slice(0, 300)}`);
+  const dc = JSON.parse(r1.body);
+
+  console.log("\n─────────────────────────────────────────────────────────────");
+  console.log("  Xbox Live Login — Device Code Flow");
+  console.log("─────────────────────────────────────────────────────────────");
+  console.log(`  1. Open in your browser:  ${dc.verification_uri}`);
+  console.log(`  2. Enter the code:        ${dc.user_code}`);
+  console.log(`  3. Sign in with:          Adopted Kz (Microsoft account)`);
+  console.log("─────────────────────────────────────────────────────────────");
+  console.log("  Waiting for login...");
+
+  const deadline = Date.now() + dc.expires_in * 1000;
+  while (Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, (dc.interval + 1) * 1000));
+    const r2 = await httpsReq(
+      `https://login.microsoftonline.com/${MSA_TENANT}/oauth2/v2.0/token`,
+      "POST",
+      { "Content-Type": "application/x-www-form-urlencoded" },
+      new URLSearchParams({
+        client_id:   MSA_CLIENT_ID,
+        grant_type:  "urn:ietf:params:oauth:grant-type:device_code",
+        device_code: dc.device_code,
+      }).toString()
+    );
+    if (r2.status === 200) {
+      console.log("  ✔ Login successful!\n");
+      return JSON.parse(r2.body);
+    }
+    const e = JSON.parse(r2.body);
+    if (e.error === "authorization_pending") { process.stdout.write("."); continue; }
+    if (e.error === "authorization_declined") throw new Error("Login declined by user.");
+    throw new Error(`Token poll error: ${r2.body.slice(0, 200)}`);
+  }
+  throw new Error("Device code expired. Run --login again.");
+}
+
+async function refreshMsaToken(refreshToken) {
+  const r = await httpsReq(
+    `https://login.microsoftonline.com/${MSA_TENANT}/oauth2/v2.0/token`,
+    "POST",
+    { "Content-Type": "application/x-www-form-urlencoded" },
+    new URLSearchParams({
+      client_id:     MSA_CLIENT_ID,
+      grant_type:    "refresh_token",
+      refresh_token: refreshToken,
+      scope:         MSA_SCOPES,
+    }).toString()
+  );
+  if (r.status !== 200) throw new Error(`MSA refresh failed ${r.status}: ${r.body.slice(0, 200)}`);
+  return JSON.parse(r.body);
+}
+
+// ── Get a valid XSTS token from cache or MSA tokens ───────────────────────────
+async function getAuthFromCache() {
+  const cache = loadCache();
+  const now   = Date.now();
+
+  // 1. Try cached fullXstsToken (from save-sync.ts --login)
+  if (cache.fullXstsToken && cache.fullXstsExpiry > now + 60_000 && cache.xuid) {
+    const header = `XBL3.0 x=${cache.fullUserHash};${cache.fullXstsToken}`;
+    console.log(`  ✔ Using cached XSTS token (expires ${new Date(cache.fullXstsExpiry).toISOString().slice(0,16)})`);
+    return { fullHeader: header, xuid: cache.xuid };
+  }
+
+  // 2. Try plain xstsToken
+  if (cache.xstsToken && cache.xstsExpiry > now + 60_000 && cache.userHash && cache.xuid) {
+    const header = `XBL3.0 x=${cache.userHash};${cache.xstsToken}`;
+    console.log(`  ✔ Using cached XSTS token (plain, expires ${new Date(cache.xstsExpiry).toISOString().slice(0,16)})`);
+    return { fullHeader: header, xuid: cache.xuid };
+  }
+
+  // 3. Re-exchange MSA → XASU → XSTS using cached MSA access token
+  let msaAccessToken = null;
+  if (cache.msaAccessToken && cache.msaExpiry > now + 60_000) {
+    msaAccessToken = cache.msaAccessToken;
+    console.log("  ✔ Using cached MSA access token");
+  } else if (cache.msaRefreshToken) {
+    console.log("  Refreshing MSA token...");
+    try {
+      const refreshed = await refreshMsaToken(cache.msaRefreshToken);
+      msaAccessToken = refreshed.access_token;
+      const updated = { ...cache,
+        msaAccessToken: refreshed.access_token,
+        msaExpiry: Date.now() + (refreshed.expires_in ?? 3600) * 1000,
+        msaRefreshToken: refreshed.refresh_token ?? cache.msaRefreshToken,
+      };
+      saveTokenCache(updated);
+      console.log("  ✔ MSA token refreshed");
+    } catch (e) {
+      if (DEBUG) console.log(`  [DEBUG] MSA refresh error: ${e.message}`);
+    }
+  }
+
+  if (msaAccessToken) {
+    console.log("  Exchanging MSA → XASU → XSTS...");
+    try {
+      // XASU (user token)
+      const xasuR = await httpsReq(XASU_ENDPOINT, "POST",
+        { "Content-Type": "application/json", "Accept": "application/json" },
+        JSON.stringify({
+          Properties: { AuthMethod: "RPS", SiteName: "user.auth.xboxlive.com", RpsTicket: `d=${msaAccessToken}` },
+          RelyingParty: "http://auth.xboxlive.com", TokenType: "JWT",
+        })
+      );
+      if (xasuR.status !== 200) throw new Error(`XASU failed ${xasuR.status}: ${xasuR.body.slice(0, 200)}`);
+      const xasuData = JSON.parse(xasuR.body);
+
+      // XSTS
+      const xstsR = await httpsReq(XSTS_ENDPOINT, "POST",
+        { "Content-Type": "application/json", "Accept": "application/json" },
+        JSON.stringify({
+          Properties: { SandboxId: "RETAIL", UserTokens: [xasuData.Token] },
+          RelyingParty: "http://xboxlive.com", TokenType: "JWT",
+        })
+      );
+      if (xstsR.status !== 200) {
+        const xerr = (() => { try { return JSON.parse(xstsR.body)?.XErr; } catch { return undefined; } })();
+        throw new Error(`XSTS failed ${xstsR.status} XErr=${xerr}: ${xstsR.body.slice(0, 200)}`);
+      }
+      const xstsData = JSON.parse(xstsR.body);
+      const xui      = xstsData.DisplayClaims?.xui?.[0];
+      const xuid     = xui?.xid ?? cache.xuid ?? "";
+      const uhs      = xui?.uhs ?? "";
+      const expiry   = xstsData.NotAfter ? new Date(xstsData.NotAfter).getTime() : Date.now() + 3600_000;
+
+      // Update cache
+      saveTokenCache({ ...cache,
+        xstsToken: xstsData.Token, xstsExpiry: expiry,
+        userHash: uhs, xuid, gamertag: xui?.gtg ?? cache.gamertag,
+      });
+
+      console.log(`  ✔ Authenticated via MSA→XSTS: ${xui?.gtg ?? "?"} (XUID: ${xuid})`);
+      return { fullHeader: `XBL3.0 x=${uhs};${xstsData.Token}`, xuid };
+    } catch (e) {
+      console.log(`  ⚠ MSA→XSTS exchange failed: ${e.message}`);
+    }
+  }
+
+  return null; // No valid cache
+}
+
+// ── Main authenticate function: cache first, then wincred fallback ────────────
+async function authenticate() {
+  // Strategy 1: use token cache (from --login or previous run)
+  const cached = await getAuthFromCache();
+  if (cached) return cached;
+
+  // Strategy 2: try Windows Credential Manager (wincred) tokens
+  console.log("  No valid cached token — trying Windows Credential Manager...");
+  try {
+    return await authenticateFromWincred();
+  } catch (e) {
+    // If wincred also failed, give a clear message about --login
+    throw new Error(
+      `Authentication failed.\n\n` +
+      `SOLUTION: Run login first:\n` +
+      `  node tools\\push-to-xbox-windows.js --login\n\n` +
+      `This opens a browser for Microsoft sign-in. After logging in,\n` +
+      `the token is cached and works for 1 hour.\n\n` +
+      `Original error: ${e.message}`
+    );
+  }
+}
+
+// ── --login command ────────────────────────────────────────────────────────────
+async function cmdLogin() {
+  console.log("\n╔══════════════════════════════════════════════════════════════╗");
+  console.log("║   Dead Island DE — Xbox Live Login                          ║");
+  console.log("╚══════════════════════════════════════════════════════════════╝\n");
+
+  const msa = await msaDeviceCodeLogin();
+
+  // Exchange MSA → XASU → XSTS and cache everything
+  console.log("  Exchanging for Xbox Live tokens...");
+  const xasuR = await httpsReq(XASU_ENDPOINT, "POST",
+    { "Content-Type": "application/json", "Accept": "application/json" },
+    JSON.stringify({
+      Properties: { AuthMethod: "RPS", SiteName: "user.auth.xboxlive.com", RpsTicket: `d=${msa.access_token}` },
+      RelyingParty: "http://auth.xboxlive.com", TokenType: "JWT",
+    })
+  );
+  if (xasuR.status !== 200) throw new Error(`XASU failed ${xasuR.status}: ${xasuR.body.slice(0, 200)}`);
+  const xasuData = JSON.parse(xasuR.body);
+
+  const xstsR = await httpsReq(XSTS_ENDPOINT, "POST",
+    { "Content-Type": "application/json", "Accept": "application/json" },
+    JSON.stringify({
+      Properties: { SandboxId: "RETAIL", UserTokens: [xasuData.Token] },
+      RelyingParty: "http://xboxlive.com", TokenType: "JWT",
+    })
+  );
+  if (xstsR.status !== 200) {
+    const xerr = (() => { try { return JSON.parse(xstsR.body)?.XErr; } catch { return undefined; } })();
+    throw new Error(`XSTS failed ${xstsR.status} XErr=${xerr}: ${xstsR.body.slice(0, 200)}`);
+  }
+  const xstsData = JSON.parse(xstsR.body);
+  const xui      = xstsData.DisplayClaims?.xui?.[0];
+  const xuid     = xui?.xid ?? "";
+  const expiry   = xstsData.NotAfter ? new Date(xstsData.NotAfter).getTime() : Date.now() + 3600_000;
+
+  const cache = loadCache();
+  saveTokenCache({ ...cache,
+    msaAccessToken:  msa.access_token,
+    msaRefreshToken: msa.refresh_token ?? cache.msaRefreshToken,
+    msaExpiry:       Date.now() + (msa.expires_in ?? 3600) * 1000,
+    xstsToken:  xstsData.Token,
+    xstsExpiry: expiry,
+    userHash:   xui?.uhs ?? "",
+    xuid, gamertag: xui?.gtg ?? "",
+  });
+
+  console.log(`\n  ✔ Logged in as: ${xui?.gtg ?? "?"} (XUID: ${xuid})`);
+  console.log(`  ✔ Token cached at: ${CACHE_FILE}`);
+  console.log(`  ✔ Valid until: ${new Date(expiry).toLocaleString()}`);
+  console.log(`\n  Now run:\n    node tools\\push-to-xbox-windows.js --list-saves\n`);
+}
+
 // ── Entry point ────────────────────────────────────────────────────────────────
 async function main() {
+  if (LOGIN)      { await cmdLogin();     return; }
   if (LIST_SAVES) { await cmdListSaves(); return; }
   await cmdPush();
 }
