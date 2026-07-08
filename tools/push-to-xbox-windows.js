@@ -549,6 +549,18 @@ async function uploadAtom(fullHeader, xuid, data, saveName, atomName) {
     "Content-Type": "application/json", "Accept": "application/json", "x-xbl-pfn": PFN,
   }, JSON.stringify({ size: data.length }));
   if (p1.status !== 200 && p1.status !== 201) {
+    if (p1.status === 403) {
+      const body = p1.body.slice(0, 400);
+      throw new Error(
+        `GetBlobUri failed 403 — platform restriction.\n\n` +
+        `  Response: ${body}\n\n` +
+        `  This means the XSTS device token did not grant write access.\n` +
+        `  Run with --debug to see which DeviceType was used.\n` +
+        `  If you see "PoP/Nintendo" in the auth log above, the device type\n` +
+        `  did not satisfy the platform policy. Open the Xbox app on this\n` +
+        `  Windows PC, make sure Dead Island DE appears, then run again.`
+      );
+    }
     throw new Error(`GetBlobUri failed ${p1.status}: ${p1.body.slice(0, 400)}`);
   }
   const blobUri = JSON.parse(p1.body).BlobUri ?? JSON.parse(p1.body).blobUri;
@@ -807,27 +819,26 @@ async function refreshMsaToken(refreshToken) {
 }
 
 // ── ProofOfPossession device token — ephemeral ECDSA key, no wincred needed ───
-// This is the same approach as save-sync.ts --login (prismarine-auth method).
-// Xbox Live accepts an ephemeral EC key pair for device auth (DeviceType:"Win32").
-// The resulting device token, combined with the user token, gives a full XSTS
-// token that has write access to Connected Storage (no 403 platform restriction).
-async function fetchDeviceTokenPoP() {
+// Tries DeviceType variants in order until one succeeds.
+// "Win32"    → correct for Windows-native apps, may unlock write access
+// "Nintendo" → confirmed working for read; used as fallback
+async function fetchDeviceTokenPoP(deviceType = "Win32") {
   const { privateKey, publicKey } = crypto.generateKeyPairSync("ec", { namedCurve: "prime256v1" });
   const jwk = publicKey.export({ format: "jwk" });
   const proofKey  = { ...jwk, alg: "ES256", use: "sig" };
   const deviceId  = `{${crypto.randomUUID().toUpperCase()}}`;
   const serialNum = `{${crypto.randomUUID().toUpperCase()}}`;
 
-  const deviceUrl  = "https://device.auth.xboxlive.com/device/authenticate";
-  const bodyObj    = {
+  const deviceUrl = "https://device.auth.xboxlive.com/device/authenticate";
+  const bodyObj   = {
     RelyingParty: "http://auth.xboxlive.com",
     TokenType: "JWT",
     Properties: {
       AuthMethod:   "ProofOfPossession",
       Id:           deviceId,
-      DeviceType:   "Win32",
+      DeviceType:   deviceType,
       SerialNumber: serialNum,
-      Version:      "10.0.19041",
+      Version:      deviceType === "Win32" ? "10.0.19041" : "10.11.0",
       ProofKey:     proofKey,
     }
   };
@@ -841,7 +852,7 @@ async function fetchDeviceTokenPoP() {
     "Signature": sig,
   }, bodyStr);
 
-  if (r.status !== 200) throw new Error(`Device token (PoP) failed ${r.status}: ${r.body.slice(0, 300)}`);
+  if (r.status !== 200) throw new Error(`Device token (PoP/${deviceType}) failed ${r.status}: ${r.body.slice(0, 300)}`);
   const data = JSON.parse(r.body);
   if (!data.Token) throw new Error(`Device token response missing Token: ${r.body.slice(0, 200)}`);
   return data.Token;
@@ -893,13 +904,27 @@ async function getAuthFromCache() {
   if (xasuR.status !== 200) throw new Error(`XASU failed ${xasuR.status}: ${xasuR.body.slice(0, 200)}`);
   const userToken = JSON.parse(xasuR.body).Token;
 
-  // 4. Device token via ProofOfPossession (Win32, ephemeral EC key — no wincred needed)
-  console.log("  Fetching device token (ProofOfPossession/Win32)...");
-  const deviceToken = await fetchDeviceTokenPoP();
-  console.log("  ✔ Device token obtained");
+  // 4. Device token via ProofOfPossession — try Win32 first, fall back to Nintendo
+  //    Win32 → intended for Windows native apps (may grant write to Connected Storage)
+  //    Nintendo → confirmed working for reads; fallback if Win32 is rejected
+  let deviceToken = null;
+  let deviceTypeUsed = "";
+  for (const dtype of ["Win32", "Nintendo"]) {
+    try {
+      process.stdout.write(`  Fetching device token (PoP/${dtype})... `);
+      deviceToken = await fetchDeviceTokenPoP(dtype);
+      deviceTypeUsed = dtype;
+      console.log(`✔`);
+      break;
+    } catch (e) {
+      console.log(`✗ (${e.message.slice(0, 60)})`);
+      if (DEBUG) console.log(`  [DEBUG] PoP/${dtype} error: ${e.message}`);
+    }
+  }
+  if (!deviceToken) throw new Error("Failed to obtain device token via ProofOfPossession (tried Win32 and Nintendo).");
 
   // 5. Full XSTS with user + device token
-  console.log("  Exchanging for full XSTS (user + device)...");
+  console.log(`  Exchanging for full XSTS (user + PoP/${deviceTypeUsed} device)...`);
   const xstsR = await httpsReq(XSTS_ENDPOINT, "POST",
     { "Content-Type": "application/json", "Accept": "application/json", "x-xbl-contract-version": "1" },
     JSON.stringify({
@@ -928,27 +953,30 @@ async function getAuthFromCache() {
   return { fullHeader: `XBL3.0 x=${uhs};${xstsData.Token}`, xuid };
 }
 
-// ── Main authenticate function: cache first, then wincred fallback ────────────
+// ── Main authenticate function: cache → PoP → wincred ────────────────────────
 async function authenticate() {
-  // Strategy 1: use token cache (from --login or previous run)
+  // Strategy 1: token cache → MSA refresh → PoP device token → full XSTS
   const cached = await getAuthFromCache();
   if (cached) return cached;
 
-  // Strategy 2: try Windows Credential Manager (wincred) tokens
-  console.log("  No valid cached token — trying Windows Credential Manager...");
-  try {
-    return await authenticateFromWincred();
-  } catch (e) {
-    // If wincred also failed, give a clear message about --login
-    throw new Error(
-      `Authentication failed.\n\n` +
-      `SOLUTION: Run login first:\n` +
-      `  node tools\\push-to-xbox-windows.js --login\n\n` +
-      `This opens a browser for Microsoft sign-in. After logging in,\n` +
-      `the token is cached and works for 1 hour.\n\n` +
-      `Original error: ${e.message}`
-    );
+  // Strategy 2 (Windows only): Windows Credential Manager Xtoken / Dtoken
+  if (os.platform() === "win32") {
+    console.log("  No valid cached token — trying Windows Credential Manager...");
+    try {
+      return await authenticateFromWincred();
+    } catch (e) {
+      if (DEBUG) console.log(`  [DEBUG] wincred error: ${e.message}`);
+    }
   }
+
+  throw new Error(
+    `Authentication failed — no valid token available.\n\n` +
+    `SOLUTION: Run login first:\n` +
+    `  node tools\\push-to-xbox-windows.js --login\n\n` +
+    `After logging in, the token is cached and works for ~1 hour.\n` +
+    `If you already ran --login, your MSA token may have expired;\n` +
+    `run --login again.`
+  );
 }
 
 // ── --login command ────────────────────────────────────────────────────────────
