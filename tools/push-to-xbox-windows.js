@@ -196,30 +196,80 @@ if ($out.Count -eq 0) {
   }
 }
 
-// ── Parse Xbox token JSON from wincred blob ────────────────────────────────────
-function parseXblToken(blob) {
-  try {
-    // May have trailing 'X' characters — strip them
-    const fixed  = (blob ?? "").trimEnd().replace(/X+$/, "").trim();
-    if (!fixed || fixed === "null") return null;
-    const parsed = JSON.parse(fixed);
-    const td     = parsed.TokenData ?? parsed;
-    const token  = td.Token ?? td.token ?? null;
-    if (!token) return null;
-    const expiry = td.NotAfter ? new Date(td.NotAfter).getTime() : Date.now() + 3600_000;
-    return { token, expiry };
-  } catch { return null; }
+// ── Parse Xbox token blob from Windows Credential Manager ─────────────────────
+// XblGrts credentials store tokens in one of these formats:
+//   1. JSON:  {"Token":"eyJ...","NotAfter":"2026-...","DisplayClaims":{...}}
+//   2. JWT:   eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9...  (base64url string)
+//   3. XBL3.0 header string: XBL3.0 x=<uhs>;<jwt>
+// All may have trailing null bytes or 'X' padding from the wincred blob size.
+function parseXblTokenBlob(blob) {
+  if (!blob) return null;
+  // Strip trailing padding (null bytes read as Unicode may become empty chars, X padding, whitespace)
+  const fixed = blob.replace(/\0/g, "").replace(/X+$/, "").trim();
+  if (!fixed || fixed === "null" || fixed.length < 10) return null;
+
+  // Format 3: already a full XBL3.0 Authorization header → extract JWT directly
+  if (fixed.startsWith("XBL3.0 ")) {
+    const jwt = fixed.replace(/^XBL3\.0\s+x=[^;]+;/, "").trim();
+    if (jwt.startsWith("eyJ")) return { token: fixed, xblHeader: fixed, expiry: Date.now() + 3600_000 };
+  }
+
+  // Format 1: JSON blob
+  if (fixed.startsWith("{")) {
+    try {
+      const parsed = JSON.parse(fixed);
+      const td     = parsed.TokenData ?? parsed;
+      const token  = td.Token ?? td.token ?? null;
+      if (!token) return null;
+      const expiry = td.NotAfter ? new Date(td.NotAfter).getTime() : Date.now() + 3600_000;
+      // Check for embedded DisplayClaims (Xtoken may have uhs + xuid directly)
+      const xui  = td.DisplayClaims?.xui?.[0] ?? parsed.DisplayClaims?.xui?.[0];
+      return { token, expiry, uhs: xui?.uhs, xuid: xui?.xid, gtg: xui?.gtg };
+    } catch {}
+  }
+
+  // Format 2: raw JWT string (base64url: starts with "eyJ")
+  if (fixed.startsWith("eyJ")) {
+    try {
+      // Decode the JWT payload to get expiry and claims
+      const parts = fixed.split(".");
+      if (parts.length >= 2) {
+        const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+        const expiry  = payload.exp ? payload.exp * 1000 : Date.now() + 3600_000;
+        return { token: fixed, expiry };
+      }
+    } catch {}
+    // If payload decode fails, still return the token (assume valid)
+    return { token: fixed, expiry: Date.now() + 3600_000 };
+  }
+
+  if (DEBUG) console.log(`  [DEBUG]   Unknown blob format (first 60): ${fixed.slice(0, 60)}`);
+  return null;
+}
+
+// Extract the "type" segment from an XblGrts credential name.
+// Name format: XblGrts|<accountId>|<titleId>|<env>|<sandbox>|<type>|<relyingParty>|...|[suffix]
+// e.g. "XblGrts|506671725|00037FFEC60ED8C9|Production|RETAIL|Xtoken|http://xboxlive.com|"
+function getXblGrtsType(name) {
+  const parts = name.split("|");
+  // type is always the 6th pipe-segment (index 5) in XblGrts format
+  return parts.length > 5 ? parts[5].toLowerCase() : name.toLowerCase();
+}
+
+function getXblGrtsRelyingParty(name) {
+  const parts = name.split("|");
+  return parts.length > 6 ? parts[6].toLowerCase() : "";
+}
+
+function getXblGrtsAccountId(name) {
+  const parts = name.split("|");
+  return parts.length > 1 ? parts[1] : "";
 }
 
 // ── Authenticate using Windows Credential Manager tokens ──────────────────────
 async function authenticateFromWincred() {
   console.log("  Reading Xbox tokens from Windows Credential Manager...");
   const creds = readWincredTokens();
-
-  if (DEBUG) {
-    console.log(`  [DEBUG] Found ${creds.length} Xbl credential(s)`);
-    for (const c of creds) console.log(`  [DEBUG]   ${c.name}`);
-  }
 
   if (creds.length === 0) {
     throw new Error(
@@ -234,60 +284,173 @@ async function authenticateFromWincred() {
     );
   }
 
+  if (DEBUG) {
+    console.log(`  [DEBUG] Found ${creds.length} Xbl credential(s):`);
+    for (const c of creds) {
+      const t = parseXblTokenBlob(c.blob);
+      const blobPreview = (c.blob ?? "").slice(0, 80).replace(/\n/g, " ");
+      console.log(`  [DEBUG]   ${c.name}`);
+      console.log(`  [DEBUG]     blob(80): ${blobPreview}`);
+      console.log(`  [DEBUG]     parsed:   ${t ? `token[${t.token.slice(0,20)}...] exp=${t.expiry}` : "NULL"}`);
+    }
+  }
+
+  const now = Date.now();
+
+  // ── Strategy 1: look for Xtoken for http://xboxlive.com (XSTS already done) ──
+  // This is the most direct path — the Xbox app already exchanged tokens for us.
+  // We need: uhs (user hash) + the Xtoken JWT → build XBL3.0 x=<uhs>;<token>
+  // The uhs may be encoded in the JWT payload or in a paired Utoken.
+  let xtokenHeader = null;
+  let xtokenXuid   = null;
+  let xtokenGtg    = null;
+
+  // Collect all candidate Xtokens for xboxlive.com, prefer the one with a titleId set
+  const xtokens = creds.filter(c => {
+    const type = getXblGrtsType(c.name);
+    const rp   = getXblGrtsRelyingParty(c.name);
+    return type === "xtoken" && rp.includes("xboxlive.com");
+  });
+
+  if (xtokens.length > 0) {
+    // Sort: prefer entries that have a titleId segment (they tend to be more specific)
+    // and that have a parseable blob
+    for (const cred of xtokens) {
+      const t = parseXblTokenBlob(cred.blob);
+      if (!t || !t.token) continue;
+      if (t.expiry < now) {
+        if (DEBUG) console.log(`  [DEBUG] Xtoken expired: ${cred.name.slice(0, 70)}`);
+        continue;
+      }
+
+      // If the blob is already an XBL3.0 header string, use it directly
+      if (t.xblHeader) {
+        xtokenHeader = t.xblHeader;
+        xtokenXuid   = t.xuid ?? "";
+        xtokenGtg    = t.gtg  ?? "?";
+        console.log(`  ✔ Xtoken (ready): ${cred.name.slice(0, 70)}`);
+        break;
+      }
+
+      // Otherwise the blob is a JWT — we need the uhs to build the header.
+      // Try to decode it from the JWT payload claims.
+      let uhs  = t.uhs ?? null;
+      let xuid = t.xuid ?? null;
+      let gtg  = t.gtg  ?? null;
+
+      if (!uhs) {
+        // Try to extract from JWT payload directly
+        try {
+          const parts = t.token.split(".");
+          if (parts.length >= 2) {
+            const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+            uhs  = payload.uhs ?? payload.UserHash ?? null;
+            xuid = payload.xid ?? payload.xuid ?? payload.sub ?? null;
+            gtg  = payload.gtg ?? payload.gamertag ?? null;
+          }
+        } catch {}
+      }
+
+      if (!uhs) {
+        // Look for a matching Utoken for the same account to get the uhs
+        const accountId = getXblGrtsAccountId(cred.name);
+        const utokenCred = creds.find(c2 => {
+          return getXblGrtsType(c2.name) === "utoken" &&
+                 getXblGrtsAccountId(c2.name) === accountId;
+        });
+        if (utokenCred) {
+          const ut = parseXblTokenBlob(utokenCred.blob);
+          if (ut?.token) {
+            try {
+              const parts = ut.token.split(".");
+              if (parts.length >= 2) {
+                const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+                uhs  = payload.uhs ?? payload.UserHash ?? null;
+                xuid = xuid ?? payload.xid ?? payload.xuid ?? payload.sub ?? null;
+              }
+            } catch {}
+          }
+        }
+      }
+
+      if (uhs) {
+        xtokenHeader = `XBL3.0 x=${uhs};${t.token}`;
+        xtokenXuid   = xuid ?? "";
+        xtokenGtg    = gtg  ?? "?";
+        console.log(`  ✔ Xtoken (JWT+uhs): ${cred.name.slice(0, 70)}`);
+        break;
+      }
+
+      if (DEBUG) console.log(`  [DEBUG] Xtoken found but could not determine uhs: ${cred.name.slice(0, 70)}`);
+    }
+  }
+
+  if (xtokenHeader) {
+    // Verify the token works + get authoritative xuid via the profile endpoint
+    console.log("  Verifying Xtoken against Xbox Live...");
+    const r = await httpsReq(
+      "https://profile.xboxlive.com/users/me/profile/settings?settings=Gamertag",
+      "GET",
+      { "Authorization": xtokenHeader, "x-xbl-contract-version": "2", "Accept": "application/json" }
+    );
+    if (r.status === 200) {
+      try {
+        const profile = JSON.parse(r.body);
+        const xuid = profile.profileUsers?.[0]?.id ?? xtokenXuid ?? "";
+        const gtg  = profile.profileUsers?.[0]?.settings?.find(s => s.id === "Gamertag")?.value ?? xtokenGtg ?? "?";
+        console.log(`  ✔ Authenticated via Xtoken: ${gtg} (XUID: ${xuid})`);
+        return { fullHeader: xtokenHeader, xuid };
+      } catch {}
+    }
+    if (DEBUG) console.log(`  [DEBUG] Xtoken profile verify: ${r.status} — ${r.body.slice(0, 200)}`);
+    // If verification failed, fall through to Dtoken+Utoken exchange
+    console.log("  ⚠ Xtoken verify failed — falling back to Dtoken+Utoken exchange...");
+  }
+
+  // ── Strategy 2: exchange Dtoken + Utoken → XSTS ───────────────────────────────
   let deviceToken = null;
   let userToken   = null;
-  const now       = Date.now();
 
   for (const cred of creds) {
-    const t = parseXblToken(cred.blob);
-    if (!t || !t.token) {
-      if (DEBUG) console.log(`  [DEBUG]   Could not parse blob for: ${cred.name}`);
-      continue;
-    }
-    if (t.expiry && t.expiry < now) {
-      console.log(`    (expired: ${cred.name.slice(0, 70)})`);
-      continue;
-    }
-    const nameLC = cred.name.toLowerCase();
-    if (nameLC.includes("dtoken") || nameLC.includes("devicetoken")) {
-      deviceToken = t.token;
-      console.log(`  ✔ Device token: ${cred.name.slice(0, 70)}`);
-    } else if (nameLC.includes("utoken") || nameLC.includes("usertoken")) {
-      if (t.token === "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA") continue;
-      userToken = t.token;
-      console.log(`  ✔ User token:   ${cred.name.slice(0, 70)}`);
+    const type = getXblGrtsType(cred.name);
+    const t    = parseXblTokenBlob(cred.blob);
+    if (!t || !t.token) continue;
+    if (t.expiry < now) continue;
+
+    if (type === "dtoken") {
+      if (!deviceToken) {
+        deviceToken = t.token;
+        console.log(`  ✔ Device token: ${cred.name.slice(0, 70)}`);
+      }
+    } else if (type === "utoken") {
+      // Skip the placeholder all-A token
+      if (t.token.replace(/A/g, "").length === 0) continue;
+      if (!userToken) {
+        userToken = t.token;
+        console.log(`  ✔ User token:   ${cred.name.slice(0, 70)}`);
+      }
     }
   }
 
-  if (!deviceToken && !userToken) {
-    // Dump all found names to help diagnose
-    const names = creds.map(c => "    " + c.name.slice(0, 80)).join("\n");
+  if (!deviceToken || !userToken) {
+    const names = creds.map(c => "    " + c.name.slice(0, 90)).join("\n");
+    const missing = [!deviceToken && "Dtoken", !userToken && "Utoken"].filter(Boolean).join(", ");
     throw new Error(
-      "Found Xbox credentials but none contain a device or user token.\n" +
-      "Found credential names:\n" + names + "\n\n" +
-      "The token blobs may use a different format than expected.\n" +
-      "Run with --debug to see the raw output."
+      `Could not find usable ${missing} credential(s).\n\n` +
+      `Found ${creds.length} Xbl credential(s):\n${names}\n\n` +
+      `FIXES TO TRY:\n` +
+      `  1. Open Xbox app → sign out → sign back in → wait 30s → retry\n` +
+      `  2. Launch Dead Island DE once from the Xbox app (Cloud Gaming works too)\n` +
+      `  3. Run: node tools\\push-to-xbox-windows.js --list-saves --debug\n` +
+      `     and share the output for diagnosis.`
     );
-  }
-
-  if (!deviceToken) {
-    throw new Error(
-      "No Xbox device token (Dtoken) found.\n" +
-      "The device token is needed to write to Xbox Connected Storage.\n" +
-      "Make sure Gaming Services is installed and you're signed in to the Xbox app.\n" +
-      "Try: sign out of Xbox app → sign back in → launch a game briefly → retry."
-    );
-  }
-
-  if (!userToken) {
-    throw new Error("No Xbox user token (Utoken) found. Sign in to the Xbox app and retry.");
   }
 
   // Generate key pair for signing
   const { privateKey } = crypto.generateKeyPairSync("ec", { namedCurve: "prime256v1" });
 
-  // Exchange user + device tokens → XSTS
-  console.log("  Exchanging for XSTS token...");
+  // Exchange Dtoken + Utoken → XSTS
+  console.log("  Exchanging Dtoken+Utoken for XSTS token...");
   const xstsBody = JSON.stringify({
     RelyingParty: "http://xboxlive.com",
     TokenType: "JWT",
@@ -301,14 +464,18 @@ async function authenticateFromWincred() {
 
   if (r.status !== 200) {
     const xerr = (() => { try { return JSON.parse(r.body)?.XErr; } catch { return undefined; } })();
-    const msgs = { "2148916233": "No Xbox profile at xbox.com", "2148916238": "Child account needs family consent" };
+    const msgs = {
+      "2148916233": "No Xbox profile at xbox.com",
+      "2148916238": "Child account needs family consent",
+      "2148916235": "Account region not supported",
+    };
     throw new Error(`XSTS failed ${r.status}: ${msgs[String(xerr)] ?? r.body.slice(0, 300)}`);
   }
 
   const xsts = JSON.parse(r.body);
   const xui  = xsts.DisplayClaims?.xui?.[0];
   const xuid = xui?.xid ?? "";
-  console.log(`  ✔ Authenticated: ${xui?.gtg ?? "?"} (XUID: ${xuid})`);
+  console.log(`  ✔ Authenticated via XSTS exchange: ${xui?.gtg ?? "?"} (XUID: ${xuid})`);
   return { fullHeader: `XBL3.0 x=${xui?.uhs};${xsts.Token}`, xuid };
 }
 
