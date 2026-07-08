@@ -537,6 +537,8 @@ async function authenticateFromWincred() {
 }
 
 // ── 4-phase upload pipeline ────────────────────────────────────────────────────
+// Returns the new atom UUID on success.
+// Throws { code: "PLATFORM_RESTRICTION" } on 403 so callers can retry with a different token.
 async function uploadAtom(fullHeader, xuid, data, saveName, atomName) {
   const newAtomUuid = crypto.randomUUID().toUpperCase();
   const BLOCK_SIZE  = 4 * 1024 * 1024; // 4 MB
@@ -550,16 +552,10 @@ async function uploadAtom(fullHeader, xuid, data, saveName, atomName) {
   }, JSON.stringify({ size: data.length }));
   if (p1.status !== 200 && p1.status !== 201) {
     if (p1.status === 403) {
-      const body = p1.body.slice(0, 400);
-      throw new Error(
-        `GetBlobUri failed 403 — platform restriction.\n\n` +
-        `  Response: ${body}\n\n` +
-        `  This means the XSTS device token did not grant write access.\n` +
-        `  Run with --debug to see which DeviceType was used.\n` +
-        `  If you see "PoP/Nintendo" in the auth log above, the device type\n` +
-        `  did not satisfy the platform policy. Open the Xbox app on this\n` +
-        `  Windows PC, make sure Dead Island DE appears, then run again.`
-      );
+      const err = new Error(`platform_restriction`);
+      err.code = "PLATFORM_RESTRICTION";
+      err.body = p1.body;
+      throw err;
     }
     throw new Error(`GetBlobUri failed ${p1.status}: ${p1.body.slice(0, 400)}`);
   }
@@ -728,13 +724,77 @@ Options:
     return;
   }
 
-  // Authenticate
-  console.log("\n  Authenticating...");
-  const { fullHeader, xuid } = await authenticate();
+  // ── Try to upload with PoP token first, then fall back to wincred on 403 ──────
+  // The Connected Storage write API requires a native Gaming Services device token.
+  // Our PoP token works for reads but may be rejected for writes (code 2016).
+  // If that happens, we automatically try Windows Credential Manager (Xbox app tokens).
+  const authAttempts = [
+    async () => {
+      console.log("\n  Authenticating (PoP)...");
+      return await authenticate();
+    },
+  ];
 
-  // Upload
-  console.log("\n  Uploading via 4-phase pipeline...");
-  const newGuid = await uploadAtom(fullHeader, xuid, uploadBytes, saveName, atomName);
+  // On Windows, add wincred as a second attempt
+  if (os.platform() === "win32") {
+    authAttempts.push(async () => {
+      console.log("\n  PoP token rejected — retrying with Windows Credential Manager...");
+      console.log("  (Ensure Xbox app is signed in as Adopted Kz)");
+      // Clear the cached PoP token so getAuthFromCache doesn't short-circuit
+      try {
+        const cache = loadCache();
+        delete cache.fullXstsToken;
+        delete cache.fullXstsExpiry;
+        delete cache.fullUserHash;
+        saveTokenCache(cache);
+      } catch {}
+      return await authenticateFromWincred();
+    });
+  }
+
+  let newGuid = null;
+  let lastErr = null;
+  for (let i = 0; i < authAttempts.length; i++) {
+    let auth;
+    try {
+      auth = await authAttempts[i]();
+    } catch (e) {
+      if (DEBUG) console.log(`  [DEBUG] Auth attempt ${i + 1} failed: ${e.message}`);
+      lastErr = e;
+      continue;
+    }
+
+    console.log("\n  Uploading via 4-phase pipeline...");
+    try {
+      newGuid = await uploadAtom(auth.fullHeader, auth.xuid, uploadBytes, saveName, atomName);
+      break; // success
+    } catch (e) {
+      if (e.code === "PLATFORM_RESTRICTION") {
+        console.log(`\n  ✗ Phase 1: 403 — platform restriction (device token not accepted for writes)`);
+        if (DEBUG) console.log(`  [DEBUG] 403 body: ${e.body}`);
+        lastErr = e;
+        continue; // try next auth strategy
+      }
+      throw e; // non-403 error — don't retry
+    }
+  }
+
+  if (!newGuid) {
+    // All strategies failed — give full diagnosis
+    const wincredHint = os.platform() === "win32"
+      ? `\n  FIX: Open Xbox app → make sure Dead Island DE is in your library\n` +
+        `       → launch the game at least once from Xbox app\n` +
+        `       → wait 30 seconds → run this script again.\n\n` +
+        `  If the Xbox app is already open and you're signed in as Adopted Kz,\n` +
+        `  try: node tools\\push-to-xbox-windows.js --list-saves --debug\n` +
+        `  and check whether Dtoken appears in the output.`
+      : `\n  NOTE: Push to Xbox Live write API requires a Windows Gaming Services\n` +
+        `  device token. Run this script on a Windows PC with the Xbox app.`;
+    throw new Error(
+      `Upload failed — Connected Storage rejected all auth attempts (platform restriction).\n` +
+      wincredHint
+    );
+  }
 
   // Update local manifest with new GUID
   fs.writeFileSync(manifestPath, JSON.stringify({
@@ -1032,8 +1092,70 @@ async function cmdLogin() {
   console.log(`\n  Now run:\n    node tools\\push-to-xbox-windows.js --list-saves\n`);
 }
 
+// ── --wincred-debug ────────────────────────────────────────────────────────────
+function cmdWincredDebug() {
+  if (os.platform() !== "win32") {
+    console.log("  --wincred-debug only works on Windows.");
+    return;
+  }
+  console.log("\n  Reading Windows Credential Manager (XblGrts entries)...\n");
+  let creds;
+  try {
+    creds = readWincredTokens();
+  } catch (e) {
+    console.error("  ✗ Failed to read credentials:", e.message);
+    return;
+  }
+  if (creds.length === 0) {
+    console.log("  No XblGrts credentials found.\n");
+    console.log("  FIX: Open Xbox app → sign in → launch Dead Island DE once → wait 30s → retry.");
+    return;
+  }
+
+  const now = Date.now();
+  console.log(`  Found ${creds.length} XblGrts credential(s):\n`);
+  for (const c of creds) {
+    const type = getXblGrtsType(c.name);
+    const rp   = getXblGrtsRelyingParty(c.name);
+    const t    = parseXblTokenBlob(c.blob);
+    const expired = t ? (t.expiry < now ? "  ⚠ EXPIRED" : "  ✔ valid") : "  ✗ unreadable";
+    const expStr  = t ? new Date(t.expiry).toLocaleString() : "?";
+    console.log(`  [${type.padEnd(8)}] ${c.name.slice(0, 75)}`);
+    console.log(`             rp=${rp}  exp=${expStr}${expired}`);
+  }
+
+  const hasXtoken  = creds.some(c => getXblGrtsType(c.name) === "xtoken");
+  const hasDtoken  = creds.some(c => getXblGrtsType(c.name) === "dtoken");
+  const hasUtoken  = creds.some(c => getXblGrtsType(c.name) === "utoken");
+  const validDtoken = creds.some(c => {
+    if (getXblGrtsType(c.name) !== "dtoken") return false;
+    const t = parseXblTokenBlob(c.blob);
+    return t && t.expiry > now;
+  });
+
+  console.log(`\n  Summary:`);
+  console.log(`    Xtoken : ${hasXtoken  ? "✔ present" : "✗ missing"}`);
+  console.log(`    Dtoken : ${hasDtoken  ? (validDtoken ? "✔ present + valid" : "⚠ present but EXPIRED") : "✗ missing"}`);
+  console.log(`    Utoken : ${hasUtoken  ? "✔ present" : "✗ missing"}`);
+
+  if (!hasDtoken || !validDtoken) {
+    console.log(`\n  ⚠ No valid Dtoken — the Xbox app has not cached a device token yet.`);
+    console.log(`  Steps to fix:`);
+    console.log(`    1. Open the Xbox app (start menu → "Xbox")`);
+    console.log(`    2. Make sure you are signed in as "Adopted Kz"`);
+    console.log(`    3. Find "Dead Island: Definitive Edition" in your library`);
+    console.log(`    4. Click "Play" (it can be Cloud Gaming — no download needed)`);
+    console.log(`    5. Wait ~10 seconds for Gaming Services to cache the token`);
+    console.log(`    6. Close the game, then run the push command again`);
+  } else {
+    console.log(`\n  ✔ Dtoken found. Run: node tools\\push-to-xbox-windows.js --input saves\\save_1.sav_dec_edited.bin`);
+  }
+  console.log();
+}
+
 // ── Entry point ────────────────────────────────────────────────────────────────
 async function main() {
+  if (hasFlag("--wincred-debug")) { cmdWincredDebug(); return; }
   if (LOGIN)      { await cmdLogin();     return; }
   if (LIST_SAVES) { await cmdListSaves(); return; }
   await cmdPush();
