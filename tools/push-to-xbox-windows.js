@@ -66,6 +66,13 @@ const MSA_SCOPES    = "Xboxlive.signin Xboxlive.offline_access offline_access";
 const XSTS_ENDPOINT = "https://xsts.auth.xboxlive.com/xsts/authorize";
 const XASU_ENDPOINT = "https://user.auth.xboxlive.com/user/authenticate";
 
+// Xbox Live legacy client (login.live.com) — same client ID as xbcsmgr.
+// This client ID is permitted to do RPS device auth with t= prefix.
+const LIVE_CLIENT_ID = "000000004c12ae6f";
+const LIVE_SCOPE     = "service::user.auth.xboxlive.com::MBI_SSL";
+const LIVE_ENDPOINT  = "https://login.live.com/oauth20_token.srf";
+const LIVE_AUTH_URL  = "https://login.live.com/oauth20_authorize.srf";
+
 function loadCache() {
   try { if (fs.existsSync(CACHE_FILE)) return JSON.parse(fs.readFileSync(CACHE_FILE, "utf8")); } catch {}
   return {};
@@ -922,8 +929,9 @@ async function refreshMsaToken(refreshToken) {
 
 // ── RPS device token — same method as xbcsmgr AuthenticateDeviceToken ─────────
 // xbcsmgr uses AuthMethod:"RPS" with tokenPrefix "t=" (not "d=") for device auth.
-// This is the correct method for getting a write-capable Dtoken.
-async function fetchDeviceTokenRPS(msaAccessToken) {
+// Requires a live.com access token (from --login-live), NOT an MSAL token.
+// The live.com client ID (000000004c12ae6f) is whitelisted for device RPS auth.
+async function fetchDeviceTokenRPS(liveAccessToken) {
   const { privateKey, publicKey } = crypto.generateKeyPairSync("ec", { namedCurve: "prime256v1" });
   const jwk      = publicKey.export({ format: "jwk" });
   const proofKey = { kty: jwk.kty, alg: "ES256", use: "sig", crv: jwk.crv, x: jwk.x, y: jwk.y };
@@ -935,7 +943,7 @@ async function fetchDeviceTokenRPS(msaAccessToken) {
     Properties: {
       AuthMethod: "RPS",
       SiteName:   "user.auth.xboxlive.com",
-      RpsTicket:  `t=${msaAccessToken}`,
+      RpsTicket:  `t=${liveAccessToken}`,
       ProofKey:   proofKey,
       Version:    "10.0.19041",
     }
@@ -1050,15 +1058,21 @@ async function getAuthFromCache() {
   let deviceToken = null;
   let deviceTypeUsed = "";
 
-  // Try RPS first (same as xbcsmgr)
-  try {
-    process.stdout.write(`  Fetching device token (RPS/t=)... `);
-    deviceToken = await fetchDeviceTokenRPS(msaAccessToken);
-    deviceTypeUsed = "RPS";
-    console.log(`✔`);
-  } catch (e) {
-    console.log(`✗ (${e.message.slice(0, 80)})`);
-    if (DEBUG) console.log(`  [DEBUG] RPS device token error: ${e.message}`);
+  // Try RPS first (same as xbcsmgr) — requires live.com access token from --login-live
+  const liveToken = cache.liveAccessToken && cache.liveExpiry > now + 60_000
+    ? cache.liveAccessToken : null;
+  if (liveToken) {
+    try {
+      process.stdout.write(`  Fetching device token (RPS/live.com)... `);
+      deviceToken = await fetchDeviceTokenRPS(liveToken);
+      deviceTypeUsed = "RPS";
+      console.log(`✔`);
+    } catch (e) {
+      console.log(`✗ (${e.message.slice(0, 80)})`);
+      if (DEBUG) console.log(`  [DEBUG] RPS device token error: ${e.message}`);
+    }
+  } else {
+    console.log(`  (skipping RPS device auth — run --login-live first to enable write access)`);
   }
 
   // Fall back to PoP if RPS failed
@@ -1133,6 +1147,74 @@ async function authenticate() {
     `If you already ran --login, your MSA token may have expired;\n` +
     `run --login again.`
   );
+}
+
+// ── --login-live command (login.live.com, same client as xbcsmgr) ─────────────
+// This gives an access token that works with RPS t= device auth.
+// The flow uses the device code pattern against login.live.com.
+async function cmdLoginLive() {
+  console.log("\n╔══════════════════════════════════════════════════════════════╗");
+  console.log("║   Dead Island DE — Xbox Live Login (live.com / xbcsmgr)     ║");
+  console.log("╚══════════════════════════════════════════════════════════════╝\n");
+
+  // login.live.com device code flow
+  const r1 = await httpsReq(
+    `https://login.live.com/oauth20_connect.srf`,
+    "POST",
+    { "Content-Type": "application/x-www-form-urlencoded" },
+    new URLSearchParams({
+      client_id: LIVE_CLIENT_ID,
+      scope:     LIVE_SCOPE,
+      response_type: "device_code",
+    }).toString()
+  );
+  if (r1.status !== 200) throw new Error(`Live device code failed ${r1.status}: ${r1.body.slice(0, 300)}`);
+  const dc = JSON.parse(r1.body);
+
+  console.log("\n─────────────────────────────────────────────────────────────");
+  console.log("  Xbox Live Login (live.com) — Device Code Flow");
+  console.log("─────────────────────────────────────────────────────────────");
+  console.log(`  1. Open in your browser:  ${dc.verification_uri ?? "https://www.microsoft.com/link"}`);
+  console.log(`  2. Enter the code:        ${dc.user_code}`);
+  console.log(`  3. Sign in with:          Adopted Kz (Microsoft account)`);
+  console.log("─────────────────────────────────────────────────────────────");
+  console.log("  Waiting for login...");
+
+  const deadline = Date.now() + (dc.expires_in ?? 900) * 1000;
+  while (Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, ((dc.interval ?? 5) + 1) * 1000));
+    const r2 = await httpsReq(
+      LIVE_ENDPOINT,
+      "POST",
+      { "Content-Type": "application/x-www-form-urlencoded" },
+      new URLSearchParams({
+        client_id:   LIVE_CLIENT_ID,
+        grant_type:  "urn:ietf:params:oauth:grant-type:device_code",
+        device_code: dc.device_code,
+      }).toString()
+    );
+    if (r2.status === 200) {
+      const tokens = JSON.parse(r2.body);
+      console.log("  ✔ Login successful!\n");
+
+      // Cache the live access token separately so RPS device auth can use it
+      const cache = loadCache();
+      saveTokenCache({ ...cache,
+        liveAccessToken:  tokens.access_token,
+        liveRefreshToken: tokens.refresh_token,
+        liveExpiry: Date.now() + (tokens.expires_in ?? 3600) * 1000,
+      });
+      console.log(`  ✔ Live token cached at: ${CACHE_FILE}`);
+      console.log(`  ✔ Valid until: ${new Date(Date.now() + (tokens.expires_in ?? 3600) * 1000).toLocaleString()}`);
+      console.log(`\n  Now run:\n    node tools\\push-to-xbox-windows.js --input saves\\save_1.sav_dec_edited.bin\n`);
+      return;
+    }
+    const e = JSON.parse(r2.body);
+    if (e.error === "authorization_pending") { process.stdout.write("."); continue; }
+    if (e.error === "authorization_declined") throw new Error("Login declined by user.");
+    throw new Error(`Token poll error: ${r2.body.slice(0, 200)}`);
+  }
+  throw new Error("Device code expired. Run --login-live again.");
 }
 
 // ── --login command ────────────────────────────────────────────────────────────
@@ -1375,6 +1457,7 @@ else { $out | ConvertTo-Json -Depth 2 -Compress }
 // ── Entry point ────────────────────────────────────────────────────────────────
 async function main() {
   if (hasFlag("--wincred-debug")) { cmdWincredDebug(); return; }
+  if (hasFlag("--login-live"))    { await cmdLoginLive(); return; }
   if (LOGIN)      { await cmdLogin();     return; }
   if (LIST_SAVES) { await cmdListSaves(); return; }
   await cmdPush();
