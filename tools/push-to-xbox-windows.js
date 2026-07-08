@@ -806,22 +806,60 @@ async function refreshMsaToken(refreshToken) {
   return JSON.parse(r.body);
 }
 
-// ── Get a valid XSTS token from cache or MSA tokens ───────────────────────────
-// For Connected Storage WRITE, Xbox Live requires a DeviceToken in the XSTS request.
-// We try to get the Dtoken from Windows Credential Manager (fresh if Xbox app is open)
-// and include it in the XSTS exchange. Without it, writes return 403 platform restriction.
+// ── ProofOfPossession device token — ephemeral ECDSA key, no wincred needed ───
+// This is the same approach as save-sync.ts --login (prismarine-auth method).
+// Xbox Live accepts an ephemeral EC key pair for device auth (DeviceType:"Win32").
+// The resulting device token, combined with the user token, gives a full XSTS
+// token that has write access to Connected Storage (no 403 platform restriction).
+async function fetchDeviceTokenPoP() {
+  const { privateKey, publicKey } = crypto.generateKeyPairSync("ec", { namedCurve: "prime256v1" });
+  const jwk = publicKey.export({ format: "jwk" });
+  const proofKey  = { ...jwk, alg: "ES256", use: "sig" };
+  const deviceId  = `{${crypto.randomUUID().toUpperCase()}}`;
+  const serialNum = `{${crypto.randomUUID().toUpperCase()}}`;
+
+  const deviceUrl  = "https://device.auth.xboxlive.com/device/authenticate";
+  const bodyObj    = {
+    RelyingParty: "http://auth.xboxlive.com",
+    TokenType: "JWT",
+    Properties: {
+      AuthMethod:   "ProofOfPossession",
+      Id:           deviceId,
+      DeviceType:   "Win32",
+      SerialNumber: serialNum,
+      Version:      "10.0.19041",
+      ProofKey:     proofKey,
+    }
+  };
+  const bodyStr = JSON.stringify(bodyObj);
+  const sig     = xblSign(privateKey, deviceUrl, "", bodyStr);
+
+  const r = await httpsReq(deviceUrl, "POST", {
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+    "x-xbl-contract-version": "2",
+    "Signature": sig,
+  }, bodyStr);
+
+  if (r.status !== 200) throw new Error(`Device token (PoP) failed ${r.status}: ${r.body.slice(0, 300)}`);
+  const data = JSON.parse(r.body);
+  if (!data.Token) throw new Error(`Device token response missing Token: ${r.body.slice(0, 200)}`);
+  return data.Token;
+}
+
+// ── Get a valid XSTS token from cache or MSA + fresh PoP device token ─────────
 async function getAuthFromCache() {
   const cache = loadCache();
   const now   = Date.now();
 
-  // 1. Try cached fullXstsToken (from save-sync.ts --login full chain)
+  // 1. Try cached fullXstsToken (from previous successful auth)
   if (cache.fullXstsToken && cache.fullXstsExpiry > now + 60_000 && cache.xuid) {
     const header = `XBL3.0 x=${cache.fullUserHash};${cache.fullXstsToken}`;
     console.log(`  ✔ Using cached full XSTS token (expires ${new Date(cache.fullXstsExpiry).toISOString().slice(0,16)})`);
     return { fullHeader: header, xuid: cache.xuid };
   }
 
-  // 2. Try to get MSA access token (from cache or refresh)
+  // 2. Get MSA access token (from cache or refresh)
   let msaAccessToken = null;
   if (cache.msaAccessToken && cache.msaExpiry > now + 60_000) {
     msaAccessToken = cache.msaAccessToken;
@@ -841,81 +879,53 @@ async function getAuthFromCache() {
     }
   }
 
-  if (msaAccessToken) {
-    // Try to get a Dtoken from wincred to include in XSTS (needed for write access)
-    let dtokenForXsts = null;
-    try {
-      const creds = readWincredTokens();
-      const now2  = Date.now();
-      for (const cred of creds) {
-        if (getXblGrtsType(cred.name) !== "dtoken") continue;
-        const t = parseXblTokenBlob(cred.blob);
-        if (!t?.token || t.expiry < now2) continue;
-        dtokenForXsts = t.token;
-        console.log(`  ✔ Found Dtoken from wincred: ${cred.name.slice(0, 65)}`);
-        break;
-      }
-    } catch (e) {
-      if (DEBUG) console.log(`  [DEBUG] Wincred Dtoken lookup failed: ${e.message}`);
-    }
+  if (!msaAccessToken) return null;
 
-    console.log("  Exchanging MSA → XASU → XSTS" + (dtokenForXsts ? " (+Dtoken)" : "") + "...");
-    try {
-      // XASU (user token)
-      const xasuR = await httpsReq(XASU_ENDPOINT, "POST",
-        { "Content-Type": "application/json", "Accept": "application/json" },
-        JSON.stringify({
-          Properties: { AuthMethod: "RPS", SiteName: "user.auth.xboxlive.com", RpsTicket: `d=${msaAccessToken}` },
-          RelyingParty: "http://auth.xboxlive.com", TokenType: "JWT",
-        })
-      );
-      if (xasuR.status !== 200) throw new Error(`XASU failed ${xasuR.status}: ${xasuR.body.slice(0, 200)}`);
-      const xasuData = JSON.parse(xasuR.body);
+  // 3. User token (XASU)
+  console.log("  Fetching user token...");
+  const xasuR = await httpsReq(XASU_ENDPOINT, "POST",
+    { "Content-Type": "application/json", "Accept": "application/json" },
+    JSON.stringify({
+      Properties: { AuthMethod: "RPS", SiteName: "user.auth.xboxlive.com", RpsTicket: `d=${msaAccessToken}` },
+      RelyingParty: "http://auth.xboxlive.com", TokenType: "JWT",
+    })
+  );
+  if (xasuR.status !== 200) throw new Error(`XASU failed ${xasuR.status}: ${xasuR.body.slice(0, 200)}`);
+  const userToken = JSON.parse(xasuR.body).Token;
 
-      // XSTS — include DeviceToken if available
-      const xstsProps = { SandboxId: "RETAIL", UserTokens: [xasuData.Token] };
-      if (dtokenForXsts) xstsProps.DeviceToken = dtokenForXsts;
-      const xstsR = await httpsReq(XSTS_ENDPOINT, "POST",
-        { "Content-Type": "application/json", "Accept": "application/json" },
-        JSON.stringify({ Properties: xstsProps, RelyingParty: "http://xboxlive.com", TokenType: "JWT" })
-      );
-      if (xstsR.status !== 200) {
-        const xerr = (() => { try { return JSON.parse(xstsR.body)?.XErr; } catch { return undefined; } })();
-        if (DEBUG) console.log(`  [DEBUG] XSTS body: ${xstsR.body.slice(0, 300)}`);
-        throw new Error(`XSTS failed ${xstsR.status} XErr=${xerr}: ${xstsR.body.slice(0, 200)}`);
-      }
-      const xstsData = JSON.parse(xstsR.body);
-      const xui      = xstsData.DisplayClaims?.xui?.[0];
-      const xuid     = xui?.xid ?? cache.xuid ?? "";
-      const uhs      = xui?.uhs ?? "";
-      const expiry   = xstsData.NotAfter ? new Date(xstsData.NotAfter).getTime() : Date.now() + 3600_000;
+  // 4. Device token via ProofOfPossession (Win32, ephemeral EC key — no wincred needed)
+  console.log("  Fetching device token (ProofOfPossession/Win32)...");
+  const deviceToken = await fetchDeviceTokenPoP();
+  console.log("  ✔ Device token obtained");
 
-      // Cache the result — mark as fullXsts if we included a Dtoken
-      const cacheUpdate = { ...cache, xuid, gamertag: xui?.gtg ?? cache.gamertag };
-      if (dtokenForXsts) {
-        cacheUpdate.fullXstsToken  = xstsData.Token;
-        cacheUpdate.fullXstsExpiry = expiry;
-        cacheUpdate.fullUserHash   = uhs;
-      } else {
-        cacheUpdate.xstsToken  = xstsData.Token;
-        cacheUpdate.xstsExpiry = expiry;
-        cacheUpdate.userHash   = uhs;
-      }
-      saveTokenCache(cacheUpdate);
-
-      const label = dtokenForXsts ? "MSA+Dtoken→XSTS" : "MSA→XSTS";
-      console.log(`  ✔ Authenticated via ${label}: ${xui?.gtg ?? "?"} (XUID: ${xuid})`);
-      if (!dtokenForXsts) {
-        console.log(`  ⚠ No Dtoken found — write to Connected Storage may get 403.`);
-        console.log(`    Open Xbox app, launch Dead Island once, then retry.`);
-      }
-      return { fullHeader: `XBL3.0 x=${uhs};${xstsData.Token}`, xuid };
-    } catch (e) {
-      console.log(`  ⚠ MSA→XSTS exchange failed: ${e.message}`);
-    }
+  // 5. Full XSTS with user + device token
+  console.log("  Exchanging for full XSTS (user + device)...");
+  const xstsR = await httpsReq(XSTS_ENDPOINT, "POST",
+    { "Content-Type": "application/json", "Accept": "application/json", "x-xbl-contract-version": "1" },
+    JSON.stringify({
+      RelyingParty: "http://xboxlive.com",
+      TokenType: "JWT",
+      Properties: { SandboxId: "RETAIL", UserTokens: [userToken], DeviceToken: deviceToken },
+    })
+  );
+  if (xstsR.status !== 200) {
+    const xerr = (() => { try { return JSON.parse(xstsR.body)?.XErr; } catch { return undefined; } })();
+    if (DEBUG) console.log(`  [DEBUG] XSTS body: ${xstsR.body.slice(0, 400)}`);
+    throw new Error(`Full XSTS failed ${xstsR.status} XErr=${xerr}: ${xstsR.body.slice(0, 200)}`);
   }
+  const xstsData = JSON.parse(xstsR.body);
+  const xui      = xstsData.DisplayClaims?.xui?.[0];
+  const xuid     = xui?.xid ?? cache.xuid ?? "";
+  const uhs      = xui?.uhs ?? "";
+  const expiry   = xstsData.NotAfter ? new Date(xstsData.NotAfter).getTime() : Date.now() + 3600_000;
 
-  return null; // No valid cache
+  saveTokenCache({ ...cache,
+    fullXstsToken: xstsData.Token, fullXstsExpiry: expiry, fullUserHash: uhs,
+    xuid, gamertag: xui?.gtg ?? cache.gamertag,
+  });
+
+  console.log(`  ✔ Full XSTS obtained: ${xui?.gtg ?? "?"} (XUID: ${xuid})`);
+  return { fullHeader: `XBL3.0 x=${uhs};${xstsData.Token}`, xuid };
 }
 
 // ── Main authenticate function: cache first, then wincred fallback ────────────
