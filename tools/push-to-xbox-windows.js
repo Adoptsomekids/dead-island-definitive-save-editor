@@ -232,17 +232,25 @@ if ($out.Count -eq 0) {
   try {
     let parsed = JSON.parse(output);
     if (!Array.isArray(parsed)) parsed = [parsed];
-    // Decode hex → Buffer → UTF-16LE string (the native encoding of XblGrts blobs)
+    // xbcsmgr reads blobs via Marshal.PtrToStringAnsi — they are raw ANSI/latin1 strings.
+    // DPAPI decrypt fails (Gaming Services writes under a different session) so we fall back
+    // to reading the raw bytes as latin1, which matches how xbcsmgr reads them.
     return parsed.map(c => {
       const hexStr = c.hex ?? "";
       let blob = "";
       if (hexStr.length > 0) {
         const buf = Buffer.from(hexStr, "hex");
-        // Token blobs are UTF-8 JSON strings (Gaming Services stores them as UTF-8, not UTF-16LE)
-        blob = buf.toString("utf8");
+        // Try latin1 first (xbcsmgr / Marshal.PtrToStringAnsi behaviour)
+        const latin1 = buf.toString("latin1").replace(/\0/g, "");
+        // Also try utf8 in case Gaming Services version stored as UTF-8
+        const utf8 = (() => { try { return buf.toString("utf8").replace(/\0/g, ""); } catch { return ""; } })();
+        // Pick whichever looks like a JWT or JSON token
+        blob = (latin1.startsWith("{") || latin1.startsWith("eyJ")) ? latin1
+             : (utf8.startsWith("{")   || utf8.startsWith("eyJ"))   ? utf8
+             : latin1; // default to latin1 (matches xbcsmgr)
       }
       if (DEBUG && blob) {
-        const preview = blob.slice(0, 80).replace(/\0/g, "");
+        const preview = blob.slice(0, 120).replace(/[^\x20-\x7e]/g, "?");
         console.log(`  [DEBUG] decoded blob for ${c.name?.slice(0,50)}: ${preview}`);
       }
       return { name: c.name, blob };
@@ -503,21 +511,30 @@ async function authenticateFromWincred() {
     );
   }
 
-  // Generate key pair for signing
-  const { privateKey } = crypto.generateKeyPairSync("ec", { namedCurve: "prime256v1" });
-
-  // Exchange Dtoken + Utoken → XSTS
+  // Exchange Dtoken + Utoken → XSTS (same as xbcsmgr AuthorizeXsts)
+  // Use unsigned request — xbcsmgr signs with its own EC key but XSTS also accepts unsigned
   console.log("  Exchanging Dtoken+Utoken for XSTS token...");
   const xstsBody = JSON.stringify({
     RelyingParty: "http://xboxlive.com",
     TokenType: "JWT",
     Properties: { SandboxId: "RETAIL", UserTokens: [userToken], DeviceToken: deviceToken },
   });
-  const sig = xblSign(privateKey, "https://xsts.auth.xboxlive.com/xsts/authorize", "", xstsBody);
-  const r   = await httpsReq("https://xsts.auth.xboxlive.com/xsts/authorize", "POST", {
-    "Content-Type": "application/json", "Accept": "application/json",
-    "x-xbl-contract-version": "1", "Signature": sig,
-  }, xstsBody);
+
+  // Try with signature first (in case server requires it), fall back without
+  let r;
+  try {
+    const { privateKey } = crypto.generateKeyPairSync("ec", { namedCurve: "prime256v1" });
+    const sig = xblSign(privateKey, "https://xsts.auth.xboxlive.com/xsts/authorize", "", xstsBody);
+    r = await httpsReq("https://xsts.auth.xboxlive.com/xsts/authorize", "POST", {
+      "Content-Type": "application/json", "Accept": "application/json",
+      "x-xbl-contract-version": "1", "Signature": sig,
+    }, xstsBody);
+  } catch {
+    r = await httpsReq("https://xsts.auth.xboxlive.com/xsts/authorize", "POST", {
+      "Content-Type": "application/json", "Accept": "application/json",
+      "x-xbl-contract-version": "1",
+    }, xstsBody);
+  }
 
   if (r.status !== 200) {
     const xerr = (() => { try { return JSON.parse(r.body)?.XErr; } catch { return undefined; } })();
@@ -526,13 +543,14 @@ async function authenticateFromWincred() {
       "2148916238": "Child account needs family consent",
       "2148916235": "Account region not supported",
     };
+    if (DEBUG) console.log(`  [DEBUG] XSTS wincred body: ${r.body.slice(0, 300)}`);
     throw new Error(`XSTS failed ${r.status}: ${msgs[String(xerr)] ?? r.body.slice(0, 300)}`);
   }
 
   const xsts = JSON.parse(r.body);
   const xui  = xsts.DisplayClaims?.xui?.[0];
   const xuid = xui?.xid ?? "";
-  console.log(`  ✔ Authenticated via XSTS exchange: ${xui?.gtg ?? "?"} (XUID: ${xuid})`);
+  console.log(`  ✔ Authenticated via wincred XSTS: ${xui?.gtg ?? "?"} (XUID: ${xuid})`);
   return { fullHeader: `XBL3.0 x=${xui?.uhs};${xsts.Token}`, xuid };
 }
 
