@@ -1,4 +1,4 @@
-# Dead Island DE — Save Editor
+# Dead Island DE — Save Editor v2.1
 
 > **Xbox Series X · Definitive Edition · No Windows Required**  
 > Full save editor for Dead Island Definitive Edition.  
@@ -10,26 +10,33 @@
 
 ---
 
-## ✅ What Works Right Now
+## ✅ What Works (v2.1)
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| 💀 Player level (1–60) | ✅ Working | |
-| 💰 Money / wallet | ✅ Working | Max ~$9,999,999 |
-| ❤️ Max HP (current + max) | ✅ Working | |
-| ⚔️ Weapon durability | ✅ Working | Per-slot or all at once |
-| 🎯 Weapon ammo/quantity | ✅ Working | Firearms = ammo count |
-| 🎒 Inventory items (craft parts, consumables) | ✅ Working | 36+ item types |
-| 🗄️ Storage chest (stash) | ✅ Working | Weapons stored in the shared chest |
-| 📡 Download saves from Xbox Live | ✅ Working | Direct OAuth2 — no Xbox bridge needed |
-| 📡 Push edited save back to Xbox Live | ✅ Working | `--cs-push` command |
-| 🌐 Local web editor UI | ✅ Working | `http://127.0.0.1:3000` |
-| 🖥️ All 3 save types (prologue/early/late) | ✅ Working | Perfect byte-for-byte round-trip |
-| 🗺️ Map fog / skills / collectibles | 🔬 Research | rawTail preserved — not yet editable |
+| 💀 Player level (1–60) | ✅ | |
+| 💰 Money / wallet | ✅ | Max ~$9,999,999 |
+| ❤️ Max HP + current HP | ✅ | |
+| ⚔️ Weapon durability | ✅ | Per-slot or all at once |
+| 🎯 Weapon ammo/quantity | ✅ | Firearms = ammo count |
+| 🎒 Inventory items | ✅ | 33 craft part types + consumables |
+| 🗄️ Storage chest (stash) | ✅ | Shared stash between characters |
+| 🏆 Collectibles (42 items) | ✅ | Named ID cards, newspapers, audio tapes |
+| ⚡ Skill trees | ✅ | Unlock all / reset all |
+| 🗺️ Map fog of war | ✅ | Reveal or hide full map |
+| ⭐ God Mode preset | ✅ | lvl60 + $9.9M + max HP + max dur + all collectibles |
+| ➕ Add item/weapon | ✅ | Inject any craft part, consumable, or weapon |
+| 🗺️ Teleport to any map | ✅ | Hotel/Resort/Moresby/Jungle/Prison |
+| 🧑 Change character | ✅ | Sam B, Xian Mei, Logan Carter, Purna |
+| 📡 Download saves from Xbox Live | ✅ | Direct OAuth2 — no Xbox bridge needed |
+| 📡 Push edited save to Xbox Live | ⚠️ macOS → 403 | Use Windows push tool instead |
+| 🪟 Windows push tool | ✅ | Reads Xbox tokens from Windows Credential Manager |
+| 🌐 Local web editor UI | ✅ | `http://127.0.0.1:3000` |
+| 🖥️ All 3 save types | ✅ | Prologue/early/late — byte-perfect round-trip |
 
 ---
 
-## How It Works (Architecture)
+## How It Works
 
 ```
 Xbox Live Connected Storage
@@ -50,12 +57,13 @@ Xbox Live Connected Storage
         │  gzip re-compress
         ▼
   save-sync.ts --cs-push           ← pushes edited .bin back to Xbox Live
+  (or on Windows: node tools/push-to-xbox-windows.js)
         │
         ▼
   Xbox loads new save on next launch
 ```
 
-**No Xbox Developer Mode required.** Everything goes through the official Xbox Live REST API using your Microsoft account credentials (the same ones you use to sign in on Xbox).
+**No Xbox Developer Mode required.** Everything goes through the official Xbox Live REST API using your Microsoft account credentials.
 
 ---
 
@@ -71,126 +79,143 @@ npm install
 ### 2. Authenticate with Xbox Live (one-time)
 
 ```bash
-# Standard login (works for listing saves + manifest download)
 npx ts-node tools/save-sync.ts --login
-# → Opens browser with a code — sign in with your Xbox account
-
-# Legacy login (needed for full binary atom download/upload)
-npx ts-node tools/save-sync.ts --login-legacy
-# → Opens a login page — sign in again (same account)
+# → Shows a device code + URL — open the URL and enter the code
 # Tokens are cached in ~/.xbox-savebridge-tokens.json
 ```
 
 ### 3. Download Your Saves
 
 ```bash
-# Download all save manifests + binary atoms to ./saves/
+# Download all saves (manifests + binary atoms) to ./saves/
 npx ts-node tools/save-sync.ts --cs-pull --out ./saves --full
 ```
 
-This creates files like:
+This creates:
 - `saves/save_1.sav_dec.bin` — decompressed save (3–7 KB, ready to edit)
-- `saves/save_1.sav_manifest.json` — atom GUID (needed for push)
+- `saves/save_1.sav_manifest.json` — atom GUID (needed for push back)
 
 ### 4. Launch the Web Editor
 
 ```bash
-npx ts-node tools/web-editor-server.ts --port=3000 --saves=./saves
+npx ts-node tools/web-editor-server.ts
 ```
 
-Open **http://127.0.0.1:3000** in your browser. Click any save file on the left to start editing.
+Open **http://127.0.0.1:3000** and click any save file to start editing.
 
-### 5. Or Use the CLI
+### 5. Inspect a Save (CLI)
 
 ```bash
-# Inspect a save
-npx ts-node tools/save-sync.ts --inspect --input saves/save_1.sav_dec.bin
+npx ts-node tools/save-sync.ts --info --input saves/save_1.sav_dec.bin
+```
 
-# Edit: money + god mode + max durability
-npx ts-node tools/save-sync.ts --edit \
-  --input saves/save_1.sav_dec.bin \
-  --money 9999999 --level 60 --max-hp 9999 --max-durability \
-  --output saves/save_1_MAXED.bin
-
-# God mode preset (level 60 + $9.9M + HP 9999 + max durability)
-# (use --edit with all flags above)
+Output:
+```
+┌─ PLAYER ──────────────────────────────────────────────────
+│  Character : Sam B (Type;SamB)
+│  Level     : 101
+│  HP        : 186 / 190
+│  Money     : $10,247,820
+│  Save date : 2026-07-01 04:00
+├─ WEAPONS (quick slots: 7) ────────────────────────────
+│  [H] Melee_BoGen [Craftplan_Naildcraft]  dur=60.5  qty=1  lvl=3  (held)
+│  [0] Firearm_AutoRifleGen [Craftplan_Shockrifle]  dur=ammo  qty=14  lvl=3
+│  ...
+├─ INVENTORY (36 items) ────────────────────────────────
+│  x 11  Powerup_Alcohol
+│  x  7  CraftPart_Battery
+│  ...
+├─ COLLECTIBLES ─────────────────────────────────────────────
+│  27 / 42 unlocked (ID cards · newspapers · tapes)
+└───────────────────────────────────────────────────────────
 ```
 
 ### 6. Push Edited Save Back to Xbox
 
+**On macOS** (dry-run works, real push gets 403 — platform restriction):
 ```bash
-npx ts-node tools/save-sync.ts --cs-push \
-  --input saves/save_1.sav_dec_edited.bin
-  # --manifest is auto-detected from filename
+npx ts-node tools/save-sync.ts --cs-push --input saves/save_1.sav_dec_edited.bin --dry-run
 ```
 
-Then **launch Dead Island on your Xbox** — the game will load the save from cloud storage automatically.
+**On Windows PC** (full push works):
+```bash
+# After git pull on your Windows PC:
+node tools\push-to-xbox-windows.js --list-saves
+node tools\push-to-xbox-windows.js --input saves\save_1.sav_dec_edited.bin --dry-run
+node tools\push-to-xbox-windows.js --input saves\save_1.sav_dec_edited.bin
+```
+
+Requires the **Xbox app** installed and signed in on Windows. The tool reads Xbox tokens from Windows Credential Manager automatically.
 
 ---
 
-## Web Editor Tour
+## Web Editor — Feature Tour
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│  💀 Dead Island DE — Save Editor  v2.0                      │
-├──────────────┬──────────────────────────────────────────────┤
-│ Save Files   │  🥁 Sam B                                     │
-│              │  Type;SamB · Resort – Act 1 · 2026-07-01     │
-│ save_0…bin   │  ┌──────┐ ┌───────────┐ ┌──────────┐        │
-│ save_1…bin ◀ │  │ 101  │ │ $10,247,820│ │ 186/190  │        │
-│ save_2…bin   │  │Level │ │   Money   │ │    HP    │        │
-│              │  └──────┘ └───────────┘ └──────────┘        │
-│ Upload Save  │                                               │
-│              │  ⚡ Player Stats  [Apply] [God Mode] [Max $]  │
-│              │  ⚔️  Weapons (7 slots + held)                  │
-│              │  🎒 Inventory (36 items)                       │
-│              │  🗄️  Storage Chest (5 weapons)                 │
-│              │  📍 Location info                              │
-│              │  📥 Download ⬇  |  📡 Push to Xbox            │
-└──────────────┴──────────────────────────────────────────────┘
-```
+### Panels
 
-**Features in the UI:**
-- Click any `.bin` file on the left sidebar to load it
-- **Upload Save** button (header) — drag & drop a `.bin` file from your computer
-- **God Mode** preset — sets level=60, money=$9.9M, HP=9999, all durability=100 in one click
-- **Max All Durability** — all quick-slot weapons to 100%
-- **Max All Ammo (999)** — all firearms to 999 rounds
-- **Max Inventory (999)** — all craft parts/consumables to max stack
-- **Download .bin** — save the edited file to your computer
-- **Dry Run** — simulates a push to Xbox without actually uploading
-- **Push to Xbox Live** — sends the save directly to cloud storage
+| Panel | What you can do |
+|-------|----------------|
+| ⚡ **Player Stats** | Level (1–60), Money, Max HP. Presets: God Mode / Max Money / Max Level |
+| 📍 **Location** | Read-only — current map, checkpoint, spawn point |
+| ⚔️ **Weapons** | Edit durability, quantity, level per slot. Max All Durability / Max Ammo |
+| 🎒 **Inventory** | Edit item quantities. Max All (999) / Clear All |
+| 🗄️ **Storage** | Edit stash chest weapons. Max Durability |
+| 🏆 **Collectibles** | Named list of all 42 collectibles with unlock state. Unlock All / Lock All |
+| ⚡ **Skill Trees** | Unlock all skill nodes. Reset All |
+| 🗺️ **Map Fog** | Reveal or hide the full map fog of war |
+| ➕ **Add Item** | Add craft parts/consumables by ID. Quick-pick tags for common items |
+| ➕ **Add Weapon** | Add any weapon to quick slots. Quick-pick tags + craftplan support |
+| 🗺️ **Teleport** | One-click teleport to Hotel / Resort / Moresby / Jungle / Prison |
+| 🧑 **Character** | Change to Sam B, Xian Mei, Logan Carter, or Purna |
+| 📥 **Download** | Download the edited `.bin` file |
+| 📡 **Push** | Push directly to Xbox Live (Windows via wincred) |
+| ☁️ **Pull Xbox** | Header button — download fresh saves from Xbox Live |
+
+### Presets & One-Click Actions
+
+- **⭐ God Mode** — Level 60, $9,999,999, HP 9999, all weapon durability 100, all collectibles unlocked, all skills unlocked, full map revealed
+- **💰 Max Money** — $9,999,999
+- **🏆 Max Level (60)** — Level 60
+- **🔧 Max All Durability** — All weapon slots to 100%
+- **🎯 Max All Ammo (999)** — All firearm slots to 999 rounds
+- **📦 Max All Inventory** — All craft parts and consumables to 999
 
 ---
 
 ## CLI Reference
 
 ```
-save-sync.ts — All commands:
+save-sync.ts — Commands:
 
-  --login                                Xbox Live sign-in (MSA device-code flow)
-  --login-legacy                         Legacy Xbox Live login (needed for binary download)
+  --login                                Xbox Live sign-in (device-code flow, cached)
 
   --cs-pull [--out ./saves] [--full]     Download save manifests from Xbox Live
-                                         Add --full to also download binary atom data
+                                         Add --full to also download binary blobs
 
-  --cs-push --input <file.bin>           Push edited save back to Xbox Live
-    [--manifest <manifest.json>]           Manifest file (auto-detected if omitted)
-    [--dry-run]                            Simulate without uploading
+  --info    --input <file.bin>           Inspect save: character, weapons, inventory,
+                                         storage, collectibles, rawTail
 
-  --inspect --input <file.bin>           Display full save contents (character, weapons, inventory)
-
-  --edit --input <file.bin>              Edit a save file
-    [--output <out.bin>]                   Output file (default: adds _edited suffix)
-    [--money N]                            Set wallet (e.g. 9999999)
+  --edit    --input <file.bin>           Edit a save file
+    [--output <out.bin>]                   Output path (default: adds _edited suffix)
+    [--money N]                            Set wallet
     [--level N]                            Set player level (1–60)
     [--max-hp N]                           Set max+current HP
     [--max-durability]                     Max all weapon durability
-    [--max-inventory]                      Set all inventory items to 999
-    [--item <ItemId> --item-qty N]         Set specific item quantity
+    [--unlock-collectibles]                Unlock all 42 collectibles
+    [--clear-fog]                          Reveal full map fog
 
-  --list-steam                           Find Steam save files (macOS)
-  --bridge --xbox-ip <ip>                SaveBridge status (Dev Mode only)
+  --cs-push --input <file.bin>           Push edited save to Xbox Live
+    [--manifest <manifest.json>]           Atom GUID file (auto-detected)
+    [--dry-run]                            Simulate without uploading
+```
+
+```
+push-to-xbox-windows.js — Windows only:
+
+  node tools\push-to-xbox-windows.js --list-saves
+  node tools\push-to-xbox-windows.js --input <file.bin>
+  node tools\push-to-xbox-windows.js --input <file.bin> --dry-run
+  node tools\push-to-xbox-windows.js --input <file.bin> --debug
 ```
 
 ---
@@ -200,19 +225,23 @@ save-sync.ts — All commands:
 ```
 dead-island-definitive-save-editor/
 ├── src/
-│   └── parser/
-│       ├── save-file.ts     ★ Complete binary parser/serializer (real Xbox format)
-│       └── stream.ts        ★ Binary stream reader/writer (little-endian)
+│   ├── parser/
+│   │   ├── save-file.ts     ★ Complete binary parser/serializer
+│   │   └── stream.ts          Binary stream reader/writer (little-endian)
+│   └── data/items/
+│       ├── items.json         Item ID catalog (craft parts, weapons, craftplans)
+│       └── collectibles.json  42 named collectibles (ID cards, newspapers, tapes)
 ├── tools/
-│   ├── save-sync.ts         ★ Main CLI: --login, --cs-pull, --cs-push, --inspect, --edit
-│   └── web-editor-server.ts ★ Local HTTP server + full HTML editor UI
+│   ├── save-sync.ts           ★ Main CLI: --login, --cs-pull, --cs-push, --info, --edit
+│   ├── web-editor-server.ts   ★ Local HTTP server + full HTML editor UI (v2.1)
+│   └── push-to-xbox-windows.js  Windows push tool (reads Xbox tokens from wincred)
 ├── saves/
-│   ├── save_*.sav_dec.bin   Real decompressed save files (Xbox Series X)
-│   ├── save_*_manifest.json Atom GUIDs for push
-│   └── save_*_edited.bin    Edited saves
+│   ├── save_*.sav_dec.bin     Real decompressed save files (Xbox Series X)
+│   ├── save_*_manifest.json   Atom GUIDs for push
+│   └── save_*_edited.bin      Edited saves
 ├── docs/
-│   └── save-format.md       Complete reverse-engineered binary format spec
-├── tests/                   Jest unit tests
+│   ├── save-format.md         Complete reverse-engineered binary format spec
+│   └── push-to-xbox.md        Windows push guide
 └── package.json
 ```
 
@@ -220,61 +249,58 @@ dead-island-definitive-save-editor/
 
 ## Save Format (Summary)
 
-The save file is a **gzip-compressed binary blob** stored on Xbox Live Connected Storage.  
-After decompression, the layout is:
+The save file is a **gzip-compressed binary blob** stored on Xbox Live Connected Storage.
 
 ```
-[48 bytes] Header         — sentinel=0xFFFFFFFF, version=5, level, maxHP, currHP
-[variable] Location Block — mapName, checkpoint, charTypeKey, money, saveDate
-[variable] Weapon Section — sentinel=0xFFFFFFFF, wsCount, [held+preamble], [quickSlots×N]
-[variable] Inventory      — count, [itemId, containerId, uid, qty, dur, pad] × N
-[variable] Storage Chest  — sep=1, count, pad=0, [itemId, craftplanId, ...] × N
-[variable] rawTail         — skills, quests, collectibles, map fog (preserved, not yet parsed)
+[48 bytes]  Header         — sentinel=0xFFFFFFFF, version=5, level, maxHP, currHP
+[variable]  Location Block — mapName, checkpoint, charTypeKey, money, saveDate
+[variable]  Weapon Section — sentinel, wsCount, [heldWeapon+preamble], [quickSlots×N]
+[variable]  Inventory      — count, [itemId, containerId, uid, qty, dur, pad] × N
+[variable]  Storage Chest  — sep=1, count, [itemId, craftplanId, qty, dur, lvl] × N
+[variable]  rawTail        — skills, collectibles (42 bytes), map fog (240 bytes), quests
 ```
 
-Full details in [`docs/save-format.md`](docs/save-format.md).
+Full spec in [`docs/save-format.md`](docs/save-format.md).
+
+**Three real Xbox Series X saves analyzed:**
+
+| Save | Map | Character | Level | Money |
+|------|-----|-----------|-------|-------|
+| save_0 | Hotel (Prologue) | Sam B | 101 | $8,205,506 |
+| save_1 | ACT1A Resort | Sam B | 101 | $10,247,820 |
+| save_2 | ACT1A Early | Xian Mei | 101 | $299,913 |
+
+All saves have **byte-perfect round-trip** (no checksums to update).
 
 ---
 
-## Supported Saves
+## Known Issues
 
-| Save | Map | Character | Status |
-|------|-----|-----------|--------|
-| save_0 | Hotel (Prologue) | Sam B | ✅ Basic edits, preamble=73b |
-| save_1 | ACT1A Resort | Sam B | ✅ Full parse, preamble=57b |
-| save_2 | ACT1A Early | Xian Mei | ✅ Basic edits, preamble=82b |
-
-All saves have **byte-perfect round-trip** (edited file is identical to original except for intended changes).
+| Issue | Status |
+|-------|--------|
+| Upload from macOS → 403 (platform restriction by Xbox Live) | ⚠️ Use Windows push tool |
+| `addQuickSlotWeapon` uses a zeroed preamble — game may reject weapon world position | ⚠️ Cosmetic |
+| Teleport checkpoint strings are best-guesses — game uses nearest valid checkpoint if not found | ⚠️ Cosmetic |
+| Changing character class mid-game resets character-specific skills | ⚠️ By design |
 
 ---
 
 ## Risk of Ban?
 
-Dead Island Definitive Edition is a **single-player game**.  
-The online component is limited to:
-- Co-op matchmaking (finding other players' sessions)
-- Leaderboards
-
-**There is no anti-cheat in Dead Island DE.** Rockstar, Activision, EA — they have anti-cheat. Deep Silver/Techland did not implement one for this game. Thousands of people have used DISE (the original PC save editor) for years without bans.
-
-**However:**
-- Do not use edited saves in multiplayer co-op if it crashes others' games
-- The game does not validate save data server-side
-- Xbox Live itself does not scan save file contents for cheat detection
-- Your account is safe ✅
+Dead Island Definitive Edition is a **single-player game with no anti-cheat**.  
+Xbox Live does not scan save file contents for cheat detection.  
+Thousands have used DISE (the original PC editor) for years without issues.  
+Your account is safe ✅ — just don't use in multiplayer co-op in a way that crashes others.
 
 ---
 
 ## Acknowledgements
 
 - [DISE](https://steffenl.com/projects/dead-island-save-editor) — original Dead Island PC save editor (inspiration)
-- [libvantage](https://github.com/Adoptsomekids/libvantage) — binary stream I/O framework patterns
-- [SteffenL/dead-island-2-save-editor-external](https://github.com/SteffenL/dead-island-2-save-editor-external) — DI2 editor reference
+- [SteffenL/dead-island-2-save-editor-external](https://github.com/SteffenL/dead-island-2-save-editor-external) — DI2 editor (methodology reference)
 
 ---
 
 ## Legal
 
-This project is for **personal, single-player use only**.  
-Not affiliated with Deep Silver, Techland, or Microsoft.  
-Use responsibly — do not use in competitive/ranked settings.
+Personal, single-player use only. Not affiliated with Deep Silver, Techland, or Microsoft.
