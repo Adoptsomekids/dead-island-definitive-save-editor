@@ -776,21 +776,44 @@ function inspectSave(filePath: string): void {
     console.log(`│  Basic edits (money, level, HP) still work.`);
   }
   console.log(`├─ WEAPONS (quick slots: ${save.quickSlots.length}) ────────────────────────────`);
+  if (save.heldWeapon?.itemId) {
+    const w = save.heldWeapon;
+    const craft = w.craftplanId ? ` [${w.craftplanId}]` : "";
+    const dur = w.durability < 0 ? "ammo" : w.durability.toFixed(1);
+    console.log(`│  [H] ${w.itemId}${craft}  dur=${dur}  qty=${w.quantity}  lvl=${w.itemLevel}  (held)`);
+  }
   for (let i = 0; i < save.quickSlots.length; i++) {
     const w = save.quickSlots[i];
-    const dur = w.durability.toFixed(1);
+    const dur = w.durability < 0 ? "ammo" : w.durability.toFixed(1);
     const craft = w.craftplanId ? ` [${w.craftplanId}]` : "";
     console.log(`│  [${i}] ${w.itemId}${craft}  dur=${dur}  qty=${w.quantity}  lvl=${w.itemLevel}`);
   }
   console.log(`├─ INVENTORY (${save.inventory.length} items) ────────────────────────────────`);
   const invFiltered = save.inventory.filter((it: any) => it.quantity > 0 && it.itemId);
-  for (const item of invFiltered.slice(0, 30)) {
+  for (const item of invFiltered.slice(0, 40)) {
     console.log(`│  x${String(item.quantity).padStart(3)}  ${item.itemId}`);
   }
-  if (invFiltered.length > 30) console.log(`│  ... and ${invFiltered.length - 30} more`);
+  if (invFiltered.length > 40) console.log(`│  ... and ${invFiltered.length - 40} more`);
+  console.log(`├─ STORAGE CHEST (${save.storage.length} items) ──────────────────────────────`);
+  for (const it of save.storage) {
+    const dur = it.durability < 0 ? "ammo" : it.durability.toFixed(1);
+    const craft = it.craftplanId ? ` [${it.craftplanId}]` : "";
+    console.log(`│  ${it.itemId}${craft}  dur=${dur}  qty=${it.quantity}  lvl=${it.itemLevel}`);
+  }
+  // Collectibles summary from rawTail
+  try {
+    const { parseCollectibles } = require("../src/parser/save-file");
+    const colls = parseCollectibles(save.rawTail);
+    const unlocked = colls.filter((v: boolean) => v).length;
+    console.log(`├─ COLLECTIBLES ─────────────────────────────────────────────`);
+    console.log(`│  ${unlocked} / ${colls.length} unlocked (ID cards · newspapers · tapes)`);
+  } catch {}
+  console.log(`├─ RAW TAIL ─────────────────────────────────────────────────`);
+  console.log(`│  ${save.rawTail.length.toLocaleString()} bytes (skills/collectibles/fog preserved)`);
   console.log(`└───────────────────────────────────────────────────────────`);
   console.log(`\nTip: Edit this save with:`);
   console.log(`  npx ts-node tools/save-sync.ts --edit --input "${filePath}" --money 9999999 --level 60`);
+  console.log(`  or open the web editor: npx ts-node tools/web-editor-server.ts`);
 }
 
 // ── Edit a save file ──────────────────────────────────────────────────────────

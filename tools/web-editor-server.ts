@@ -513,7 +513,7 @@ const server = http.createServer((req, res) => {
 
 server.listen(PORT, "127.0.0.1", () => {
   console.log(`\n╔══════════════════════════════════════════════════════════════╗`);
-  console.log(`║   💀 Dead Island DE — Save Editor  v2.0                      ║`);
+  console.log(`║   💀 Dead Island DE — Save Editor  v2.1                      ║`);
   console.log(`╚══════════════════════════════════════════════════════════════╝`);
   console.log(`\n  ★  Open browser → http://127.0.0.1:${PORT}`);
   console.log(`  ★  Saves folder  → ${SAVES}`);
@@ -683,7 +683,7 @@ code { background: #1a1a24; padding: 2px 6px; border-radius: 4px; font-size: 11p
   <div class="hdr-logo">💀</div>
   <div>
     <div class="hdr-title">Dead Island DE — Save Editor</div>
-    <div class="hdr-sub">Xbox Series X · Definitive Edition · v2.0</div>
+    <div class="hdr-sub">Xbox Series X · Definitive Edition · v2.1</div>
   </div>
   <div class="hdr-actions">
     <button class="btn btn-secondary btn-sm" onclick="pullFromXbox()" title="Download saves from Xbox Live (requires --login)" id="btn-pull">☁️ Pull Xbox</button>
@@ -1039,7 +1039,7 @@ function renderEditor(save) {
         </div>
         <div class="tags">
           <div style="font-size:9px;color:var(--text3);width:100%;margin-bottom:3px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;">Quick pick (click to fill):</div>
-          \${['CraftPart_MetalScrap','CraftPart_Wire','CraftPart_Blade','CraftPart_Duct_Tape','CraftPart_Nail','CraftPart_Resin','CraftPart_Battery','CraftPart_Alcohol','Medkit_Small','Medkit_Big','Powerup_Stamina','Food_Juice','Throwable_MolotovCocktail','Throwable_Grenade'].map(id =>
+          \${['CraftPart_MetalScrap','CraftPart_Wire','CraftPart_Nails','CraftPart_Tape','CraftPart_Battery','CraftPart_BatteryLarge','CraftPart_ElectronicScrap','CraftPart_CircularBlade','CraftPart_BarbedWire','CraftPart_Rag','CraftPart_Glue','CraftPart_Soap','CraftPart_GasForLighter','CraftPart_Lighter','CraftPart_EngineParts','CraftPart_Gear','CraftPart_Magnet','CraftPart_LargeNail','CraftPart_Belt','CraftPart_Clamp','Medkit_HealthPackMedium','Powerup_Alcohol','Food_Can','Throwable_Molotov'].map(id =>
             \`<span class="tag" onclick="document.getElementById('add-item-id').value='\${id}'">\${id.replace(/^(CraftPart_|Powerup_|Throwable_|Food_|Medkit_)/,'')}</span>\`
           ).join('')}
         </div>
@@ -1056,7 +1056,7 @@ function renderEditor(save) {
         </div>
         <div class="tags">
           <div style="font-size:9px;color:var(--text3);width:100%;margin-bottom:3px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;">Weapons quick pick:</div>
-          \${['Melee_BoGen','Melee_Machete','Melee_Katana','Melee_Hammer','Firearm_Pistol','Firearm_Shotgun','Firearm_AssaultRifle','Firearm_SniperRifle'].map(id =>
+          \${['Melee_BoGen','Melee_StickGen','Melee_BatGen','Melee_Paddle','Melee_Katana','Melee_Machete','Melee_Hammer','Melee_Fists','Firearm_AutoRifleGen','Firearm_ShotgunShortGen','Firearm_Pistol','Firearm_SniperRifle'].map(id =>
             \`<span class="tag weapon-tag" onclick="document.getElementById('add-wep-id').value='\${id}'">\${id.replace(/^(Melee_|Firearm_)/,'')}</span>\`
           ).join('')}
         </div>
