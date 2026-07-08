@@ -920,6 +920,42 @@ async function refreshMsaToken(refreshToken) {
   return JSON.parse(r.body);
 }
 
+// ── RPS device token — same method as xbcsmgr AuthenticateDeviceToken ─────────
+// xbcsmgr uses AuthMethod:"RPS" with tokenPrefix "t=" (not "d=") for device auth.
+// This is the correct method for getting a write-capable Dtoken.
+async function fetchDeviceTokenRPS(msaAccessToken) {
+  const { privateKey, publicKey } = crypto.generateKeyPairSync("ec", { namedCurve: "prime256v1" });
+  const jwk      = publicKey.export({ format: "jwk" });
+  const proofKey = { kty: jwk.kty, alg: "ES256", use: "sig", crv: jwk.crv, x: jwk.x, y: jwk.y };
+
+  const deviceUrl = "https://device.auth.xboxlive.com/device/authenticate";
+  const bodyObj   = {
+    RelyingParty: "http://auth.xboxlive.com",
+    TokenType: "JWT",
+    Properties: {
+      AuthMethod: "RPS",
+      SiteName:   "user.auth.xboxlive.com",
+      RpsTicket:  `t=${msaAccessToken}`,
+      ProofKey:   proofKey,
+      Version:    "10.0.19041",
+    }
+  };
+  const bodyStr = JSON.stringify(bodyObj);
+  const sig     = xblSign(privateKey, deviceUrl, "", bodyStr);
+
+  const r = await httpsReq(deviceUrl, "POST", {
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+    "x-xbl-contract-version": "2",
+    "Signature": sig,
+  }, bodyStr);
+
+  if (r.status !== 200) throw new Error(`Device token (RPS) failed ${r.status}: ${r.body.slice(0, 300)}`);
+  const data = JSON.parse(r.body);
+  if (!data.Token) throw new Error(`Device token RPS response missing Token: ${r.body.slice(0, 200)}`);
+  return data.Token;
+}
+
 // ── ProofOfPossession device token — ephemeral ECDSA key, no wincred needed ───
 // Tries DeviceType variants in order until one succeeds.
 // "Win32"    → correct for Windows-native apps, may unlock write access
@@ -960,15 +996,17 @@ async function fetchDeviceTokenPoP(deviceType = "Win32") {
   return data.Token;
 }
 
-// ── Get a valid XSTS token from cache or MSA + fresh PoP device token ─────────
+// ── Get a valid XSTS token from MSA cache + fresh device token ────────────────
 async function getAuthFromCache() {
   const cache = loadCache();
   const now   = Date.now();
 
-  // 1. Try cached fullXstsToken (from previous successful auth)
-  if (cache.fullXstsToken && cache.fullXstsExpiry > now + 60_000 && cache.xuid) {
+  // 1. Try cached fullXstsToken — but only if it came from RPS (write-capable).
+  //    We no longer re-use PoP-derived tokens for push because they get 403.
+  if (cache.fullXstsToken && cache.fullXstsExpiry > now + 60_000 && cache.xuid
+      && cache.fullXstsMethod === "RPS") {
     const header = `XBL3.0 x=${cache.fullUserHash};${cache.fullXstsToken}`;
-    console.log(`  ✔ Using cached full XSTS token (expires ${new Date(cache.fullXstsExpiry).toISOString().slice(0,16)})`);
+    console.log(`  ✔ Using cached RPS XSTS token (expires ${new Date(cache.fullXstsExpiry).toISOString().slice(0,16)})`);
     return { fullHeader: header, xuid: cache.xuid };
   }
 
@@ -994,8 +1032,8 @@ async function getAuthFromCache() {
 
   if (!msaAccessToken) return null;
 
-  // 3. User token (XASU)
-  console.log("  Fetching user token...");
+  // 3. User token (XASU) — uses d= prefix (standard MSA OAuth)
+  console.log("  Fetching user token (XASU)...");
   const xasuR = await httpsReq(XASU_ENDPOINT, "POST",
     { "Content-Type": "application/json", "Accept": "application/json" },
     JSON.stringify({
@@ -1006,27 +1044,42 @@ async function getAuthFromCache() {
   if (xasuR.status !== 200) throw new Error(`XASU failed ${xasuR.status}: ${xasuR.body.slice(0, 200)}`);
   const userToken = JSON.parse(xasuR.body).Token;
 
-  // 4. Device token via ProofOfPossession — try Win32 first, fall back to Nintendo
-  //    Win32 → intended for Windows native apps (may grant write to Connected Storage)
-  //    Nintendo → confirmed working for reads; fallback if Win32 is rejected
+  // 4. Device token — try RPS (xbcsmgr method, t= prefix) first, then PoP fallback
+  //    RPS with t= is what xbcsmgr uses and gets write-capable Dtokens
+  //    PoP is our fallback (works for reads but Connected Storage may reject writes)
   let deviceToken = null;
   let deviceTypeUsed = "";
-  for (const dtype of ["Win32", "Nintendo"]) {
-    try {
-      process.stdout.write(`  Fetching device token (PoP/${dtype})... `);
-      deviceToken = await fetchDeviceTokenPoP(dtype);
-      deviceTypeUsed = dtype;
-      console.log(`✔`);
-      break;
-    } catch (e) {
-      console.log(`✗ (${e.message.slice(0, 60)})`);
-      if (DEBUG) console.log(`  [DEBUG] PoP/${dtype} error: ${e.message}`);
+
+  // Try RPS first (same as xbcsmgr)
+  try {
+    process.stdout.write(`  Fetching device token (RPS/t=)... `);
+    deviceToken = await fetchDeviceTokenRPS(msaAccessToken);
+    deviceTypeUsed = "RPS";
+    console.log(`✔`);
+  } catch (e) {
+    console.log(`✗ (${e.message.slice(0, 80)})`);
+    if (DEBUG) console.log(`  [DEBUG] RPS device token error: ${e.message}`);
+  }
+
+  // Fall back to PoP if RPS failed
+  if (!deviceToken) {
+    for (const dtype of ["Win32", "Nintendo"]) {
+      try {
+        process.stdout.write(`  Fetching device token (PoP/${dtype})... `);
+        deviceToken = await fetchDeviceTokenPoP(dtype);
+        deviceTypeUsed = `PoP/${dtype}`;
+        console.log(`✔`);
+        break;
+      } catch (e) {
+        console.log(`✗ (${e.message.slice(0, 60)})`);
+        if (DEBUG) console.log(`  [DEBUG] PoP/${dtype} error: ${e.message}`);
+      }
     }
   }
-  if (!deviceToken) throw new Error("Failed to obtain device token via ProofOfPossession (tried Win32 and Nintendo).");
+  if (!deviceToken) throw new Error("Failed to obtain device token (tried RPS and PoP).");
 
   // 5. Full XSTS with user + device token
-  console.log(`  Exchanging for full XSTS (user + PoP/${deviceTypeUsed} device)...`);
+  console.log(`  Exchanging for full XSTS (user + ${deviceTypeUsed} device)...`);
   const xstsR = await httpsReq(XSTS_ENDPOINT, "POST",
     { "Content-Type": "application/json", "Accept": "application/json", "x-xbl-contract-version": "1" },
     JSON.stringify({
@@ -1048,6 +1101,7 @@ async function getAuthFromCache() {
 
   saveTokenCache({ ...cache,
     fullXstsToken: xstsData.Token, fullXstsExpiry: expiry, fullUserHash: uhs,
+    fullXstsMethod: deviceTypeUsed,
     xuid, gamertag: xui?.gtg ?? cache.gamertag,
   });
 
