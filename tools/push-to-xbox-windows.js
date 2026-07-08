@@ -123,35 +123,47 @@ function readWincredTokens() {
     throw new Error("This script must run on Windows — it reads Xbox tokens from Windows Credential Manager.");
   }
 
-  // PowerShell script that uses P/Invoke to call advapi32 CredEnumerateW
-  // Written to a temp .ps1 file to avoid all quote-escaping problems
+  // PowerShell script:
+  //   1. CredEnumerateW  — list all XblGrts credentials
+  //   2. CryptUnprotectData (DPAPI) — decrypt each blob (blobs are DPAPI-encrypted by Gaming Services)
+  //   3. Interpret decrypted bytes as UTF-16LE string
+  //   4. Output JSON array of {name, blob} objects
   const ps1 = `
 Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
 using System.Collections.Generic;
 using System.Text;
-public class WinCred2 {
+public class WinCred3 {
   [DllImport("advapi32", SetLastError=true, CharSet=CharSet.Unicode)]
   public static extern bool CredEnumerate(string filter, int flag, out int count, out IntPtr creds);
+  [DllImport("advapi32", SetLastError=true)]
+  public static extern bool CredFree(IntPtr buffer);
   [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
   public struct CREDENTIAL {
-    public uint Flags;
-    public uint Type;
-    public IntPtr TargetName;
-    public IntPtr Comment;
+    public uint Flags; public uint Type;
+    public IntPtr TargetName; public IntPtr Comment;
     public long LastWritten;
-    public uint CredentialBlobSize;
-    public IntPtr CredentialBlob;
-    public uint Persist;
-    public uint AttributeCount;
-    public IntPtr Attributes;
-    public IntPtr TargetAlias;
-    public IntPtr UserName;
+    public uint CredentialBlobSize; public IntPtr CredentialBlob;
+    public uint Persist; public uint AttributeCount;
+    public IntPtr Attributes; public IntPtr TargetAlias; public IntPtr UserName;
   }
+  [StructLayout(LayoutKind.Sequential)]
+  public struct DATA_BLOB {
+    public uint cbData;
+    public IntPtr pbData;
+  }
+  [DllImport("crypt32", SetLastError=true)]
+  public static extern bool CryptUnprotectData(
+    ref DATA_BLOB pDataIn, StringBuilder szDataDescr,
+    IntPtr pOptionalEntropy, IntPtr pvReserved,
+    IntPtr pPromptStruct, uint dwFlags,
+    ref DATA_BLOB pDataOut);
+  [DllImport("kernel32")]
+  public static extern IntPtr LocalFree(IntPtr hMem);
+
   public static List<string[]> Enumerate() {
-    int count;
-    IntPtr p;
+    int count; IntPtr p;
     var result = new List<string[]>();
     if (!CredEnumerate(null, 0, out count, out p)) return result;
     for (int i = 0; i < count; i++) {
@@ -160,36 +172,63 @@ public class WinCred2 {
       string name = Marshal.PtrToStringUni(c.TargetName) ?? "";
       if (!name.Contains("Xbl")) continue;
       if (c.CredentialBlob == IntPtr.Zero || c.CredentialBlobSize == 0) continue;
-      byte[] blobBytes = new byte[c.CredentialBlobSize];
-      Marshal.Copy(c.CredentialBlob, blobBytes, 0, (int)c.CredentialBlobSize);
-      string blob = Encoding.Unicode.GetString(blobBytes);
-      result.Add(new string[]{ name, blob });
+      byte[] raw = new byte[c.CredentialBlobSize];
+      Marshal.Copy(c.CredentialBlob, raw, 0, (int)c.CredentialBlobSize);
+
+      // Try DPAPI decrypt first
+      string blob = null;
+      try {
+        var inBlob  = new DATA_BLOB { cbData = (uint)raw.Length };
+        inBlob.pbData = Marshal.AllocHGlobal(raw.Length);
+        Marshal.Copy(raw, 0, inBlob.pbData, raw.Length);
+        var outBlob = new DATA_BLOB();
+        bool ok = CryptUnprotectData(ref inBlob, null, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, 0, ref outBlob);
+        Marshal.FreeHGlobal(inBlob.pbData);
+        if (ok && outBlob.pbData != IntPtr.Zero && outBlob.cbData > 0) {
+          byte[] dec = new byte[outBlob.cbData];
+          Marshal.Copy(outBlob.pbData, dec, 0, (int)outBlob.cbData);
+          LocalFree(outBlob.pbData);
+          blob = Encoding.Unicode.GetString(dec);
+        }
+      } catch {}
+
+      // Fall back: interpret raw bytes directly as UTF-16LE (unencrypted)
+      if (blob == null) blob = Encoding.Unicode.GetString(raw);
+
+      // Base64-encode the blob so it survives JSON serialization safely
+      string blobB64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(blob));
+      result.Add(new string[]{ name, blobB64 });
     }
+    CredFree(p);
     return result;
   }
 }
 '@ -Language CSharp
 
-$items = [WinCred2]::Enumerate()
+$items = [WinCred3]::Enumerate()
 $out = @()
 foreach ($item in $items) {
-  $out += [PSCustomObject]@{ name = $item[0]; blob = $item[1] }
+  $out += [PSCustomObject]@{ name = $item[0]; blobB64 = $item[1] }
 }
 if ($out.Count -eq 0) {
   Write-Output "[]"
 } else {
-  $out | ConvertTo-Json -Depth 2
+  $out | ConvertTo-Json -Depth 2 -Compress
 }
 `;
 
   const output = runPowershellScript(ps1);
-  if (DEBUG) console.log("[DEBUG] wincred raw output:", output.slice(0, 500));
+  if (DEBUG) console.log("[DEBUG] wincred raw output:", output.slice(0, 300));
 
   if (!output || output === "[]") return [];
   try {
     let parsed = JSON.parse(output);
     if (!Array.isArray(parsed)) parsed = [parsed];
-    return parsed;
+    // Decode blobB64 → blob string for each entry
+    return parsed.map(c => ({
+      name: c.name,
+      blob: c.blobB64 ? Buffer.from(c.blobB64, "base64").toString("utf8") : (c.blob ?? ""),
+    }));
   } catch (e) {
     if (DEBUG) console.error("[DEBUG] JSON parse error:", e.message, "\nOutput:", output.slice(0, 500));
     return [];
