@@ -226,35 +226,59 @@ if ($out.Count -eq 0) {
 `;
 
   const output = runPowershellScript(ps1);
-  if (DEBUG) console.log("[DEBUG] wincred raw output (first 200):", output.slice(0, 200));
+  if (DEBUG) console.log("[DEBUG] wincred raw output (first 500):", output.slice(0, 500));
 
   if (!output || output === "[]") return [];
   try {
     let parsed = JSON.parse(output);
     if (!Array.isArray(parsed)) parsed = [parsed];
-    // xbcsmgr reads blobs via Marshal.PtrToStringAnsi — they are raw ANSI/latin1 strings.
-    // DPAPI decrypt fails (Gaming Services writes under a different session) so we fall back
-    // to reading the raw bytes as latin1, which matches how xbcsmgr reads them.
-    return parsed.map(c => {
+
+    // Gaming Services splits large token blobs across multiple Credential Manager entries.
+    // The entries share a base name; continuation chunks have "|N" appended (N=1,2,...).
+    // Example:
+    //   XblGrts|704208617||...|Dtoken|...|JWT        ← chunk 0: '{"HasSignInDisplayClaims"...'
+    //   XblGrts|704208617||...|Dtoken|...|JWT|1      ← chunk 1: '...6LRw","NotAfter":"2025-02-15...'
+    // We must concatenate all chunks (in order) before trying to parse.
+
+    // Step 1 — decode each entry's hex blob as UTF-8 (blobs are plain UTF-8 JSON, not DPAPI)
+    const entries = parsed.map(c => {
       const hexStr = c.hex ?? "";
-      let blob = "";
-      if (hexStr.length > 0) {
-        const buf = Buffer.from(hexStr, "hex");
-        // Try latin1 first (xbcsmgr / Marshal.PtrToStringAnsi behaviour)
-        const latin1 = buf.toString("latin1").replace(/\0/g, "");
-        // Also try utf8 in case Gaming Services version stored as UTF-8
-        const utf8 = (() => { try { return buf.toString("utf8").replace(/\0/g, ""); } catch { return ""; } })();
-        // Pick whichever looks like a JWT or JSON token
-        blob = (latin1.startsWith("{") || latin1.startsWith("eyJ")) ? latin1
-             : (utf8.startsWith("{")   || utf8.startsWith("eyJ"))   ? utf8
-             : latin1; // default to latin1 (matches xbcsmgr)
-      }
-      if (DEBUG && blob) {
-        const preview = blob.slice(0, 120).replace(/[^\x20-\x7e]/g, "?");
-        console.log(`  [DEBUG] decoded blob for ${c.name?.slice(0,50)}: ${preview}`);
-      }
-      return { name: c.name, blob };
+      const buf    = hexStr.length > 0 ? Buffer.from(hexStr, "hex") : Buffer.alloc(0);
+      // Blobs are raw UTF-8 strings stored by Gaming Services — no DPAPI, no encoding tricks
+      const text = buf.toString("utf8");
+      return { name: c.name, text };
     });
+
+    // Step 2 — group entries by base name (strip trailing "|N" chunk suffix)
+    // Base name: everything before the last "|N" where N is a pure integer
+    const groups = new Map(); // baseName → [ {chunkIdx, text}, ... ]
+    for (const e of entries) {
+      const m = e.name.match(/^(.*)\|(\d+)$/);
+      if (m) {
+        const base  = m[1];
+        const chunk = parseInt(m[2], 10);
+        if (!groups.has(base)) groups.set(base, []);
+        groups.get(base).push({ chunkIdx: chunk, text: e.text, name: e.name });
+      } else {
+        // No chunk suffix → it's chunk 0 (or a standalone entry)
+        if (!groups.has(e.name)) groups.set(e.name, []);
+        groups.get(e.name).unshift({ chunkIdx: 0, text: e.text, name: e.name });
+      }
+    }
+
+    // Step 3 — for each group, sort chunks by index and concatenate
+    const result = [];
+    for (const [baseName, chunks] of groups) {
+      chunks.sort((a, b) => a.chunkIdx - b.chunkIdx);
+      const blob = chunks.map(c => c.text).join("");
+      if (DEBUG) {
+        const preview = blob.slice(0, 120).replace(/[^\x20-\x7e]/g, "?");
+        console.log(`  [DEBUG] assembled blob for ${baseName.slice(0,60)} (${chunks.length} chunk(s)): ${preview}`);
+      }
+      result.push({ name: baseName, blob });
+    }
+
+    return result;
   } catch (e) {
     if (DEBUG) console.error("[DEBUG] JSON parse error:", e.message, "\nOutput:", output.slice(0, 500));
     return [];
