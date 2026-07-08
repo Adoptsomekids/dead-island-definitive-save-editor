@@ -800,16 +800,51 @@ function inspectSave(filePath: string): void {
     const craft = it.craftplanId ? ` [${it.craftplanId}]` : "";
     console.log(`│  ${it.itemId}${craft}  dur=${dur}  qty=${it.quantity}  lvl=${it.itemLevel}`);
   }
-  // Collectibles summary from rawTail
-  try {
-    const { parseCollectibles } = require("../src/parser/save-file");
-    const colls = parseCollectibles(save.rawTail);
-    const unlocked = colls.filter((v: boolean) => v).length;
-    console.log(`├─ COLLECTIBLES ─────────────────────────────────────────────`);
-    console.log(`│  ${unlocked} / ${colls.length} unlocked (ID cards · newspapers · tapes)`);
-  } catch {}
-  console.log(`├─ RAW TAIL ─────────────────────────────────────────────────`);
-  console.log(`│  ${save.rawTail.length.toLocaleString()} bytes (skills/collectibles/fog preserved)`);
+  // Collectibles, skills, fog from rawTail
+  if (!save._parseError && save.rawTail) {
+    try {
+      const { parseCollectibles, RAW_TAIL_OFFSETS } = require("../src/parser/save-file");
+
+      // Collectibles
+      const colls   = parseCollectibles(save.rawTail) as boolean[];
+      const unlocked = colls.filter((v: boolean) => v).length;
+      console.log(`├─ COLLECTIBLES ─────────────────────────────────────────────`);
+      console.log(`│  ${unlocked} / ${colls.length} unlocked (ID cards · newspapers · tapes)`);
+
+      // Skills — scan rawTail[0x04–0x1FF] for [u16 nodeId, u16 pts] entries
+      const SKILLS_END = 0x200;
+      if (save.rawTail.length >= SKILLS_END) {
+        let skillsTotal = 0;
+        let skillsUnlocked = 0;
+        for (let i = 0x04; i < SKILLS_END - 4; i += 4) {
+          const nodeId = save.rawTail.readUInt16LE(i);
+          const pts    = save.rawTail.readUInt16LE(i + 2);
+          if (nodeId >= 1 && nodeId <= 50) {
+            skillsTotal++;
+            if (pts >= 1) skillsUnlocked++;
+          }
+        }
+        const skillStatus = skillsTotal > 0
+          ? `${skillsUnlocked} / ${skillsTotal} nodes unlocked`
+          : "0 nodes (skills not yet assigned in this save)";
+        console.log(`├─ SKILLS ───────────────────────────────────────────────────`);
+        console.log(`│  ${skillStatus}`);
+      }
+
+      // Map fog
+      const { FOG_DATA_START, FOG_DATA_LEN } = RAW_TAIL_OFFSETS;
+      if (save.rawTail.length >= FOG_DATA_START + FOG_DATA_LEN) {
+        const fogSlice   = save.rawTail.slice(FOG_DATA_START, FOG_DATA_START + FOG_DATA_LEN);
+        const fogSetBytes = fogSlice.filter((b: number) => b !== 0).length;
+        const fogPct     = Math.round((fogSetBytes / FOG_DATA_LEN) * 100);
+        const fogLabel   = fogPct === 0 ? "fully revealed (0% fog)" :
+                          fogPct >= 95  ? `fully hidden (${fogPct}% fog)` :
+                          `${fogPct}% fogged`;
+        console.log(`├─ MAP FOG ──────────────────────────────────────────────────`);
+        console.log(`│  ${fogLabel}`);
+      }
+    } catch {}
+  }
   console.log(`└───────────────────────────────────────────────────────────`);
   console.log(`\nTip: Edit this save with:`);
   console.log(`  npx ts-node tools/save-sync.ts --edit --input "${filePath}" --money 9999999 --level 60`);
