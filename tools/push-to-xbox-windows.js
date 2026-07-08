@@ -125,16 +125,17 @@ function readWincredTokens() {
 
   // PowerShell script:
   //   1. CredEnumerateW  — list all XblGrts credentials
-  //   2. CryptUnprotectData (DPAPI) — decrypt each blob (blobs are DPAPI-encrypted by Gaming Services)
-  //   3. Interpret decrypted bytes as UTF-16LE string
-  //   4. Output JSON array of {name, blob} objects
+  //   2. CryptUnprotectData (DPAPI) — decrypt each blob in-place
+  //   3. Emit the decrypted bytes as lowercase hex — NO string conversion at all
+  //      (avoids all UTF-16/UTF-8 re-encoding bugs)
+  //   4. Node decodes hex → Buffer → UTF-16LE string
   const ps1 = `
 Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
 using System.Collections.Generic;
 using System.Text;
-public class WinCred3 {
+public class WinCred4 {
   [DllImport("advapi32", SetLastError=true, CharSet=CharSet.Unicode)]
   public static extern bool CredEnumerate(string filter, int flag, out int count, out IntPtr creds);
   [DllImport("advapi32", SetLastError=true)]
@@ -149,16 +150,12 @@ public class WinCred3 {
     public IntPtr Attributes; public IntPtr TargetAlias; public IntPtr UserName;
   }
   [StructLayout(LayoutKind.Sequential)]
-  public struct DATA_BLOB {
-    public uint cbData;
-    public IntPtr pbData;
-  }
+  public struct DATA_BLOB { public uint cbData; public IntPtr pbData; }
   [DllImport("crypt32", SetLastError=true)]
   public static extern bool CryptUnprotectData(
     ref DATA_BLOB pDataIn, StringBuilder szDataDescr,
     IntPtr pOptionalEntropy, IntPtr pvReserved,
-    IntPtr pPromptStruct, uint dwFlags,
-    ref DATA_BLOB pDataOut);
+    IntPtr pPromptStruct, uint dwFlags, ref DATA_BLOB pDataOut);
   [DllImport("kernel32")]
   public static extern IntPtr LocalFree(IntPtr hMem);
 
@@ -175,29 +172,25 @@ public class WinCred3 {
       byte[] raw = new byte[c.CredentialBlobSize];
       Marshal.Copy(c.CredentialBlob, raw, 0, (int)c.CredentialBlobSize);
 
-      // Try DPAPI decrypt first
-      string blob = null;
+      // DPAPI decrypt — emit raw decrypted bytes as hex, no string conversion
+      byte[] finalBytes = raw;
       try {
-        var inBlob  = new DATA_BLOB { cbData = (uint)raw.Length };
+        var inBlob = new DATA_BLOB { cbData = (uint)raw.Length };
         inBlob.pbData = Marshal.AllocHGlobal(raw.Length);
         Marshal.Copy(raw, 0, inBlob.pbData, raw.Length);
         var outBlob = new DATA_BLOB();
         bool ok = CryptUnprotectData(ref inBlob, null, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, 0, ref outBlob);
         Marshal.FreeHGlobal(inBlob.pbData);
         if (ok && outBlob.pbData != IntPtr.Zero && outBlob.cbData > 0) {
-          byte[] dec = new byte[outBlob.cbData];
-          Marshal.Copy(outBlob.pbData, dec, 0, (int)outBlob.cbData);
+          finalBytes = new byte[outBlob.cbData];
+          Marshal.Copy(outBlob.pbData, finalBytes, 0, (int)outBlob.cbData);
           LocalFree(outBlob.pbData);
-          blob = Encoding.Unicode.GetString(dec);
         }
       } catch {}
 
-      // Fall back: interpret raw bytes directly as UTF-16LE (unencrypted)
-      if (blob == null) blob = Encoding.Unicode.GetString(raw);
-
-      // Base64-encode the blob so it survives JSON serialization safely
-      string blobB64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(blob));
-      result.Add(new string[]{ name, blobB64 });
+      // Emit as hex — safe across any encoding pipeline
+      string hex = BitConverter.ToString(finalBytes).Replace("-", "").ToLower();
+      result.Add(new string[]{ name, hex });
     }
     CredFree(p);
     return result;
@@ -205,10 +198,10 @@ public class WinCred3 {
 }
 '@ -Language CSharp
 
-$items = [WinCred3]::Enumerate()
+$items = [WinCred4]::Enumerate()
 $out = @()
 foreach ($item in $items) {
-  $out += [PSCustomObject]@{ name = $item[0]; blobB64 = $item[1] }
+  $out += [PSCustomObject]@{ name = $item[0]; hex = $item[1] }
 }
 if ($out.Count -eq 0) {
   Write-Output "[]"
@@ -218,17 +211,27 @@ if ($out.Count -eq 0) {
 `;
 
   const output = runPowershellScript(ps1);
-  if (DEBUG) console.log("[DEBUG] wincred raw output:", output.slice(0, 300));
+  if (DEBUG) console.log("[DEBUG] wincred raw output (first 200):", output.slice(0, 200));
 
   if (!output || output === "[]") return [];
   try {
     let parsed = JSON.parse(output);
     if (!Array.isArray(parsed)) parsed = [parsed];
-    // Decode blobB64 → blob string for each entry
-    return parsed.map(c => ({
-      name: c.name,
-      blob: c.blobB64 ? Buffer.from(c.blobB64, "base64").toString("utf8") : (c.blob ?? ""),
-    }));
+    // Decode hex → Buffer → UTF-16LE string (the native encoding of XblGrts blobs)
+    return parsed.map(c => {
+      const hexStr = c.hex ?? "";
+      let blob = "";
+      if (hexStr.length > 0) {
+        const buf = Buffer.from(hexStr, "hex");
+        // Token blobs are always UTF-16LE (Windows native wchar_t strings)
+        blob = buf.toString("utf16le");
+      }
+      if (DEBUG && blob) {
+        const preview = blob.slice(0, 80).replace(/\0/g, "");
+        console.log(`  [DEBUG] decoded blob for ${c.name?.slice(0,50)}: ${preview}`);
+      }
+      return { name: c.name, blob };
+    });
   } catch (e) {
     if (DEBUG) console.error("[DEBUG] JSON parse error:", e.message, "\nOutput:", output.slice(0, 500));
     return [];
