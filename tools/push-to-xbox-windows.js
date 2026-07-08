@@ -1093,12 +1093,127 @@ async function cmdLogin() {
 }
 
 // ── --wincred-debug ────────────────────────────────────────────────────────────
+// Also emits raw hex of Dtoken blobs (first 64 bytes) so we can diagnose encoding.
 function cmdWincredDebug() {
   if (os.platform() !== "win32") {
     console.log("  --wincred-debug only works on Windows.");
     return;
   }
   console.log("\n  Reading Windows Credential Manager (XblGrts entries)...\n");
+
+  // Also read the raw (pre-DPAPI) bytes for Dtoken entries
+  const rawPs1 = `
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Collections.Generic;
+using System.Text;
+public class WinCred5 {
+  [DllImport("advapi32", SetLastError=true, CharSet=CharSet.Unicode)]
+  public static extern bool CredEnumerate(string filter, int flag, out int count, out IntPtr creds);
+  [DllImport("advapi32", SetLastError=true)]
+  public static extern bool CredFree(IntPtr buffer);
+  [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
+  public struct CREDENTIAL {
+    public uint Flags; public uint Type;
+    public IntPtr TargetName; public IntPtr Comment;
+    public long LastWritten;
+    public uint CredentialBlobSize; public IntPtr CredentialBlob;
+    public uint Persist; public uint AttributeCount;
+    public IntPtr Attributes; public IntPtr TargetAlias; public IntPtr UserName;
+  }
+  [StructLayout(LayoutKind.Sequential)]
+  public struct DATA_BLOB { public uint cbData; public IntPtr pbData; }
+  [DllImport("crypt32", SetLastError=true)]
+  public static extern bool CryptUnprotectData(
+    ref DATA_BLOB pDataIn, StringBuilder szDataDescr,
+    IntPtr pOptionalEntropy, IntPtr pvReserved,
+    IntPtr pPromptStruct, uint dwFlags, ref DATA_BLOB pDataOut);
+  [DllImport("kernel32")]
+  public static extern IntPtr LocalFree(IntPtr hMem);
+
+  public static List<string[]> Enumerate() {
+    int count; IntPtr p;
+    var result = new List<string[]>();
+    if (!CredEnumerate(null, 0, out count, out p)) return result;
+    for (int i = 0; i < count; i++) {
+      IntPtr credPtr = Marshal.ReadIntPtr(p, i * IntPtr.Size);
+      var c = (CREDENTIAL)Marshal.PtrToStructure(credPtr, typeof(CREDENTIAL));
+      string name = Marshal.PtrToStringUni(c.TargetName) ?? "";
+      if (!name.Contains("Dtoken") && !name.Contains("Xtoken")) continue;
+      if (c.CredentialBlob == IntPtr.Zero || c.CredentialBlobSize == 0) continue;
+      byte[] raw = new byte[c.CredentialBlobSize];
+      Marshal.Copy(c.CredentialBlob, raw, 0, (int)c.CredentialBlobSize);
+
+      // Try DPAPI
+      string dpapi = "FAIL";
+      try {
+        var inBlob = new DATA_BLOB { cbData = (uint)raw.Length };
+        inBlob.pbData = Marshal.AllocHGlobal(raw.Length);
+        Marshal.Copy(raw, 0, inBlob.pbData, raw.Length);
+        var outBlob = new DATA_BLOB();
+        bool ok = CryptUnprotectData(ref inBlob, null, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, 0, ref outBlob);
+        Marshal.FreeHGlobal(inBlob.pbData);
+        if (ok && outBlob.pbData != IntPtr.Zero && outBlob.cbData > 0) {
+          byte[] dec = new byte[outBlob.cbData];
+          Marshal.Copy(outBlob.pbData, dec, 0, (int)outBlob.cbData);
+          LocalFree(outBlob.pbData);
+          dpapi = BitConverter.ToString(dec).Replace("-","").ToLower();
+        }
+      } catch {}
+
+      string rawHex = BitConverter.ToString(raw).Replace("-","").ToLower();
+      result.Add(new string[]{ name, rawHex, dpapi });
+    }
+    CredFree(p);
+    return result;
+  }
+}
+'@ -Language CSharp
+
+$items = [WinCred5]::Enumerate()
+$out = @()
+foreach ($item in $items) {
+  $out += [PSCustomObject]@{ name = $item[0]; rawHex = $item[1]; dpapi = $item[2] }
+}
+if ($out.Count -eq 0) { Write-Output "[]" }
+else { $out | ConvertTo-Json -Depth 2 -Compress }
+`;
+
+  let rawCreds = [];
+  try {
+    const rawOut = runPowershellScript(rawPs1);
+    if (rawOut && rawOut !== "[]") {
+      let parsed = JSON.parse(rawOut);
+      if (!Array.isArray(parsed)) parsed = [parsed];
+      rawCreds = parsed;
+    }
+  } catch (e) {
+    if (DEBUG) console.log("  [DEBUG] raw cred read error:", e.message);
+  }
+
+  // Print raw blob analysis for Dtoken/Xtoken entries
+  if (rawCreds.length > 0) {
+    console.log("  ── Raw blob analysis (Dtoken + Xtoken entries) ──────────────────\n");
+    for (const c of rawCreds) {
+      const isDpapi = c.dpapi !== "FAIL";
+      const rawFirst32 = c.rawHex.slice(0, 64); // first 32 bytes
+      const decodedRaw = Buffer.from(c.rawHex.slice(0, 200), "hex").toString("utf8").replace(/[^\x20-\x7e]/g, ".");
+      console.log(`  ${c.name.slice(0, 70)}`);
+      console.log(`    DPAPI decrypt : ${isDpapi ? "✔ OK" : "✗ FAILED (encrypted under different account/session)"}`);
+      console.log(`    raw[0..31]    : ${rawFirst32}`);
+      console.log(`    raw as UTF-8  : ${decodedRaw}`);
+      if (isDpapi) {
+        const decFirst = c.dpapi.slice(0, 120);
+        const decUtf8  = Buffer.from(c.dpapi.slice(0, 200), "hex").toString("utf8").replace(/[^\x20-\x7e]/g, ".");
+        console.log(`    dec[0..59]    : ${decFirst}`);
+        console.log(`    dec as UTF-8  : ${decUtf8}`);
+      }
+      console.log();
+    }
+    console.log("  ─────────────────────────────────────────────────────────────────\n");
+  }
+
   let creds;
   try {
     creds = readWincredTokens();
@@ -1135,18 +1250,26 @@ function cmdWincredDebug() {
 
   console.log(`\n  Summary:`);
   console.log(`    Xtoken : ${hasXtoken  ? "✔ present" : "✗ missing"}`);
-  console.log(`    Dtoken : ${hasDtoken  ? (validDtoken ? "✔ present + valid" : "⚠ present but EXPIRED") : "✗ missing"}`);
+  console.log(`    Dtoken : ${hasDtoken  ? (validDtoken ? "✔ present + valid" : "⚠ present but ENCRYPTED/UNREADABLE") : "✗ missing"}`);
   console.log(`    Utoken : ${hasUtoken  ? "✔ present" : "✗ missing"}`);
 
   if (!hasDtoken || !validDtoken) {
-    console.log(`\n  ⚠ No valid Dtoken — the Xbox app has not cached a device token yet.`);
-    console.log(`  Steps to fix:`);
-    console.log(`    1. Open the Xbox app (start menu → "Xbox")`);
-    console.log(`    2. Make sure you are signed in as "Adopted Kz"`);
-    console.log(`    3. Find "Dead Island: Definitive Edition" in your library`);
-    console.log(`    4. Click "Play" (it can be Cloud Gaming — no download needed)`);
-    console.log(`    5. Wait ~10 seconds for Gaming Services to cache the token`);
-    console.log(`    6. Close the game, then run the push command again`);
+    if (rawCreds.some(c => c.dpapi === "FAIL" && c.name.includes("Dtoken"))) {
+      console.log(`\n  ⚠ Dtokens exist but DPAPI decrypt failed — blobs were encrypted by a`);
+      console.log(`  different Windows user/session (Gaming Services runs as SYSTEM).`);
+      console.log(`\n  This is the root cause of the 403. There are two solutions:`);
+      console.log(`\n  ── SOLUTION 1 (recommended) ─────────────────────────────────────`);
+      console.log(`  Use xbcsmgr — a tool that bypasses this by using a different auth flow:`);
+      console.log(`    https://github.com/billynothingelse/xbcsmgr/releases`);
+      console.log(`  Download xbcsmgr.exe, run it, sign in, find Dead Island DE,`);
+      console.log(`  upload saves\\save_1.sav_dec_edited.bin to slot save_1.sav`);
+      console.log(`\n  ── SOLUTION 2 ───────────────────────────────────────────────────`);
+      console.log(`  Sign out of the Xbox app completely, sign back in, then immediately`);
+      console.log(`  run this script before Gaming Services re-encrypts the tokens.`);
+      console.log(`  (Tokens are briefly readable right after sign-in on some Windows versions)`);
+    } else {
+      console.log(`\n  ⚠ No valid Dtoken. Open Xbox app → launch Dead Island → wait 30s → retry.`);
+    }
   } else {
     console.log(`\n  ✔ Dtoken found. Run: node tools\\push-to-xbox-windows.js --input saves\\save_1.sav_dec_edited.bin`);
   }
