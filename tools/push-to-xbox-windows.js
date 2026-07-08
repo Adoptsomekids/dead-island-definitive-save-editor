@@ -807,40 +807,34 @@ async function refreshMsaToken(refreshToken) {
 }
 
 // ── Get a valid XSTS token from cache or MSA tokens ───────────────────────────
+// For Connected Storage WRITE, Xbox Live requires a DeviceToken in the XSTS request.
+// We try to get the Dtoken from Windows Credential Manager (fresh if Xbox app is open)
+// and include it in the XSTS exchange. Without it, writes return 403 platform restriction.
 async function getAuthFromCache() {
   const cache = loadCache();
   const now   = Date.now();
 
-  // 1. Try cached fullXstsToken (from save-sync.ts --login)
+  // 1. Try cached fullXstsToken (from save-sync.ts --login full chain)
   if (cache.fullXstsToken && cache.fullXstsExpiry > now + 60_000 && cache.xuid) {
     const header = `XBL3.0 x=${cache.fullUserHash};${cache.fullXstsToken}`;
-    console.log(`  ✔ Using cached XSTS token (expires ${new Date(cache.fullXstsExpiry).toISOString().slice(0,16)})`);
+    console.log(`  ✔ Using cached full XSTS token (expires ${new Date(cache.fullXstsExpiry).toISOString().slice(0,16)})`);
     return { fullHeader: header, xuid: cache.xuid };
   }
 
-  // 2. Try plain xstsToken
-  if (cache.xstsToken && cache.xstsExpiry > now + 60_000 && cache.userHash && cache.xuid) {
-    const header = `XBL3.0 x=${cache.userHash};${cache.xstsToken}`;
-    console.log(`  ✔ Using cached XSTS token (plain, expires ${new Date(cache.xstsExpiry).toISOString().slice(0,16)})`);
-    return { fullHeader: header, xuid: cache.xuid };
-  }
-
-  // 3. Re-exchange MSA → XASU → XSTS using cached MSA access token
+  // 2. Try to get MSA access token (from cache or refresh)
   let msaAccessToken = null;
   if (cache.msaAccessToken && cache.msaExpiry > now + 60_000) {
     msaAccessToken = cache.msaAccessToken;
-    console.log("  ✔ Using cached MSA access token");
   } else if (cache.msaRefreshToken) {
     console.log("  Refreshing MSA token...");
     try {
       const refreshed = await refreshMsaToken(cache.msaRefreshToken);
       msaAccessToken = refreshed.access_token;
-      const updated = { ...cache,
+      saveTokenCache({ ...cache,
         msaAccessToken: refreshed.access_token,
         msaExpiry: Date.now() + (refreshed.expires_in ?? 3600) * 1000,
         msaRefreshToken: refreshed.refresh_token ?? cache.msaRefreshToken,
-      };
-      saveTokenCache(updated);
+      });
       console.log("  ✔ MSA token refreshed");
     } catch (e) {
       if (DEBUG) console.log(`  [DEBUG] MSA refresh error: ${e.message}`);
@@ -848,7 +842,24 @@ async function getAuthFromCache() {
   }
 
   if (msaAccessToken) {
-    console.log("  Exchanging MSA → XASU → XSTS...");
+    // Try to get a Dtoken from wincred to include in XSTS (needed for write access)
+    let dtokenForXsts = null;
+    try {
+      const creds = readWincredTokens();
+      const now2  = Date.now();
+      for (const cred of creds) {
+        if (getXblGrtsType(cred.name) !== "dtoken") continue;
+        const t = parseXblTokenBlob(cred.blob);
+        if (!t?.token || t.expiry < now2) continue;
+        dtokenForXsts = t.token;
+        console.log(`  ✔ Found Dtoken from wincred: ${cred.name.slice(0, 65)}`);
+        break;
+      }
+    } catch (e) {
+      if (DEBUG) console.log(`  [DEBUG] Wincred Dtoken lookup failed: ${e.message}`);
+    }
+
+    console.log("  Exchanging MSA → XASU → XSTS" + (dtokenForXsts ? " (+Dtoken)" : "") + "...");
     try {
       // XASU (user token)
       const xasuR = await httpsReq(XASU_ENDPOINT, "POST",
@@ -861,16 +872,16 @@ async function getAuthFromCache() {
       if (xasuR.status !== 200) throw new Error(`XASU failed ${xasuR.status}: ${xasuR.body.slice(0, 200)}`);
       const xasuData = JSON.parse(xasuR.body);
 
-      // XSTS
+      // XSTS — include DeviceToken if available
+      const xstsProps = { SandboxId: "RETAIL", UserTokens: [xasuData.Token] };
+      if (dtokenForXsts) xstsProps.DeviceToken = dtokenForXsts;
       const xstsR = await httpsReq(XSTS_ENDPOINT, "POST",
         { "Content-Type": "application/json", "Accept": "application/json" },
-        JSON.stringify({
-          Properties: { SandboxId: "RETAIL", UserTokens: [xasuData.Token] },
-          RelyingParty: "http://xboxlive.com", TokenType: "JWT",
-        })
+        JSON.stringify({ Properties: xstsProps, RelyingParty: "http://xboxlive.com", TokenType: "JWT" })
       );
       if (xstsR.status !== 200) {
         const xerr = (() => { try { return JSON.parse(xstsR.body)?.XErr; } catch { return undefined; } })();
+        if (DEBUG) console.log(`  [DEBUG] XSTS body: ${xstsR.body.slice(0, 300)}`);
         throw new Error(`XSTS failed ${xstsR.status} XErr=${xerr}: ${xstsR.body.slice(0, 200)}`);
       }
       const xstsData = JSON.parse(xstsR.body);
@@ -879,13 +890,25 @@ async function getAuthFromCache() {
       const uhs      = xui?.uhs ?? "";
       const expiry   = xstsData.NotAfter ? new Date(xstsData.NotAfter).getTime() : Date.now() + 3600_000;
 
-      // Update cache
-      saveTokenCache({ ...cache,
-        xstsToken: xstsData.Token, xstsExpiry: expiry,
-        userHash: uhs, xuid, gamertag: xui?.gtg ?? cache.gamertag,
-      });
+      // Cache the result — mark as fullXsts if we included a Dtoken
+      const cacheUpdate = { ...cache, xuid, gamertag: xui?.gtg ?? cache.gamertag };
+      if (dtokenForXsts) {
+        cacheUpdate.fullXstsToken  = xstsData.Token;
+        cacheUpdate.fullXstsExpiry = expiry;
+        cacheUpdate.fullUserHash   = uhs;
+      } else {
+        cacheUpdate.xstsToken  = xstsData.Token;
+        cacheUpdate.xstsExpiry = expiry;
+        cacheUpdate.userHash   = uhs;
+      }
+      saveTokenCache(cacheUpdate);
 
-      console.log(`  ✔ Authenticated via MSA→XSTS: ${xui?.gtg ?? "?"} (XUID: ${xuid})`);
+      const label = dtokenForXsts ? "MSA+Dtoken→XSTS" : "MSA→XSTS";
+      console.log(`  ✔ Authenticated via ${label}: ${xui?.gtg ?? "?"} (XUID: ${xuid})`);
+      if (!dtokenForXsts) {
+        console.log(`  ⚠ No Dtoken found — write to Connected Storage may get 403.`);
+        console.log(`    Open Xbox app, launch Dead Island once, then retry.`);
+      }
       return { fullHeader: `XBL3.0 x=${uhs};${xstsData.Token}`, xuid };
     } catch (e) {
       console.log(`  ⚠ MSA→XSTS exchange failed: ${e.message}`);
